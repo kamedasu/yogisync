@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.sqlite
+*.db
+*.log
+token.json
+# Google OAuth client secret (絶対コミットしない)
+client_secret.json
+client_secret*.json
+
+# macOS
+.DS_Store
+

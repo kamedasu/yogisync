@@ -1,0 +1,8 @@
+google-api-python-client
+google-auth
+google-auth-oauthlib
+beautifulsoup4
+lxml
+pydantic
+python-dotenv
+python-dateutil
