@@ -43,8 +43,18 @@ class EventStore:
 
         existing = self.get_event(event_uid)
         if existing:
-            if existing["content_hash"] == content_hash:
-                return "skipped", existing["gcal_event_id"]
+            existing_gcal_event_id = existing["gcal_event_id"]
+            has_gcal_id = bool(existing_gcal_event_id)  # None / "" を両方 false扱い
+
+            # 内容が同じ＆GCal同期済みならスキップ
+            if existing["content_hash"] == content_hash and has_gcal_id:
+                return "skipped", existing_gcal_event_id
+
+            # 内容が同じ＆GCal未同期なら、DB更新は不要だけど同期は走らせたい
+            if existing["content_hash"] == content_hash and not has_gcal_id:
+                return "updated", None
+
+            # 内容が違う場合は UPDATE（gcal_event_id は保持）
             self.conn.execute(
                 """
                 UPDATE events
@@ -64,11 +74,15 @@ class EventStore:
                 ),
             )
             self.conn.commit()
-            return "updated", existing["gcal_event_id"]
+            return "updated", existing_gcal_event_id
 
+        # existing が無い場合は INSERT
         self.conn.execute(
             """
-            INSERT INTO events (event_uid, provider, date, title, reservation_id, source_url, gcal_event_id, content_hash, updated_at)
+            INSERT INTO events (
+                event_uid, provider, date, title, reservation_id, source_url,
+                gcal_event_id, content_hash, updated_at
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (

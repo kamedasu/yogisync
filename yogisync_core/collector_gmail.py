@@ -9,8 +9,10 @@ from .auth import get_credentials
 from .config import Config
 from .models import GmailMessage
 
-SCOPES_GMAIL = ["https://www.googleapis.com/auth/gmail.readonly"]
-
+SCOPES_GMAIL = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar",
+]
 
 def _decode_body(data: str) -> str:
     try:

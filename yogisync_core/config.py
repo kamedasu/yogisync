@@ -26,6 +26,7 @@ class Config:
     yogisync_calendar_id: str
     timezone: str
     sqlite_path: str
+    default_event_duration_minutes: int
 
 
 def load_config(source: Optional[SettingsSource] = None, dotenv_path: Optional[str] = None) -> Config:
@@ -52,6 +53,11 @@ def load_config(source: Optional[SettingsSource] = None, dotenv_path: Optional[s
     )
     timezone = src.get("TIMEZONE") or src.get("timezone") or "Asia/Tokyo"
     sqlite_path = src.get("SQLITE_PATH") or src.get("sqlite_path") or "data/yogisync.db"
+    default_event_duration_minutes = int(
+        src.get("DEFAULT_EVENT_DURATION_MINUTES")
+        or src.get("default_event_duration_minutes")
+        or "60"
+    )
 
     return Config(
         gmail_query=gmail_query,
@@ -60,4 +66,5 @@ def load_config(source: Optional[SettingsSource] = None, dotenv_path: Optional[s
         yogisync_calendar_id=yogisync_calendar_id,
         timezone=timezone,
         sqlite_path=sqlite_path,
+        default_event_duration_minutes=default_event_duration_minutes,
     )

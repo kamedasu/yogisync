@@ -24,6 +24,7 @@ GOOGLE_CLIENT_SECRET_PATH=client_secret.json
 GOOGLE_TOKEN_PATH=token.json
 YOGISYNC_CALENDAR_ID=YOUR_CALENDAR_ID
 TIMEZONE=Asia/Tokyo
+DEFAULT_EVENT_DURATION_MINUTES=60
 SQLITE_PATH=data/yogisync.db
 ```
 
@@ -32,12 +33,18 @@ SQLITE_PATH=data/yogisync.db
 python -m yogisync_core.cli sync --limit 50
 ```
 
-## 4) 設計メモ
+## 4) 動作確認
+```bash
+python -m compileall yogisync_core
+python -m yogisync_core.cli sync --limit 1
+```
+
+## 5) 設計メモ
 - Gmail → provider判定 → provider別パーサ → event_uidで重複排除 → Google Calendarへupsert
 - SQLiteに同期状態（event_uid / gcal_event_id / content_hash）を保存
 - Cloud側は **YogiSync専用カレンダーの読み取りのみ** を想定
 
-## 5) ディレクトリ構成
+## 6) ディレクトリ構成
 ```
 yogisync_core/
   config.py

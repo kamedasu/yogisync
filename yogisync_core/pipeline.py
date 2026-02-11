@@ -28,13 +28,23 @@ PARSER_MAP = {
 def run_sync(config: Config, limit: int = 50) -> SyncResult:
     result = SyncResult()
     store = EventStore(config.sqlite_path)
+    logger.info("pipeline: sqlite_path=%s", config.sqlite_path)
     try:
         messages = fetch_messages(config, limit=limit)
         for msg in messages:
+            logger.info("pipeline: processing msg id=%s subject=%s", msg.id, msg.subject)
+
             try:
                 provider = detect_provider(msg)
                 if not provider:
-                    logger.info("skip: provider not detected (%s)", msg.subject)
+                    logger.info(
+                        "skip: provider not detected subject=%s from=%s snippet=%s plain_len=%s html_len=%s",
+                        msg.subject,
+                        msg.from_email,
+                        (msg.snippet or "")[:80],
+                        len(msg.text_plain or ""),
+                        len(msg.text_html or "")
+                    )
                     result.skipped += 1
                     continue
 
@@ -46,12 +56,27 @@ def run_sync(config: Config, limit: int = 50) -> SyncResult:
 
                 event = parser(msg)
                 if not event:
-                    logger.info("skip: parse failed (%s)", provider)
+                    logger.info(
+                        "skip: parser not found (%s) subject=%s from=%s snippet=%s plain_len=%s html_len=%s",
+                        provider,
+                        msg.subject,
+                        msg.from_email,
+                        (msg.snippet or "")[:80],
+                        len(msg.text_plain or ""),
+                        len(msg.text_html or ""),
+                    )
                     result.skipped += 1
                     continue
 
                 action, gcal_event_id = store.upsert_event(event)
                 if action == "skipped":
+                    logger.info(
+                        "skip: store skipped (%s) event_uid=%s gcal_event_id=%s subject=%s",
+                        provider,
+                        event.ensure_event_uid(),
+                        gcal_event_id,
+                        msg.subject,
+                    )
                     result.skipped += 1
                     continue
 
@@ -70,4 +95,5 @@ def run_sync(config: Config, limit: int = 50) -> SyncResult:
     finally:
         store.close()
 
+    logging.getLogger(__name__).info("pipeline: result=%s", result)
     return result

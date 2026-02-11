@@ -27,12 +27,16 @@ class Event(BaseModel):
     def ensure_event_uid(self) -> str:
         if self.event_uid:
             return self.event_uid
-        if self.reservation_id:
-            self.event_uid = f"{self.provider}:{self.reservation_id}"
-        elif self.source_url:
-            self.event_uid = f"{self.provider}:{self.source_url}"
+        if self.time_unknown:
+            date_key = self.date.date().isoformat()
         else:
-            self.event_uid = f"{self.provider}:{self.date.isoformat()}:{self.title}"
+            date_key = self.date.replace(second=0, microsecond=0).isoformat()
+        title_key = self.title.strip()
+        if self.location_name:
+            location_key = self.location_name.strip()
+            self.event_uid = f"{self.provider}:{date_key}:{title_key}:{location_key}"
+        else:
+            self.event_uid = f"{self.provider}:{date_key}:{title_key}"
         return self.event_uid
 
     def content_hash(self) -> str:
