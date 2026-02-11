@@ -24,11 +24,18 @@ def get_calendar_service(config: Config):
 
 
 def build_description(event: Event) -> str:
+    """
+    カレンダー詳細で “必ず見える” 情報を description に出す。
+    - event_uid は ensure_event_uid() の値を採用（Peatixは reservation_id にする）
+    - reservation_id は確認番号が入る想定
+    - address も表示（メールにある住所を活かす）
+    """
     lines = [
         f"provider: {event.provider}",
         f"event_uid: {event.ensure_event_uid()}",
         f"reservation_id: {event.reservation_id or ''}",
         f"source_url: {event.source_url or ''}",
+        f"address: {event.address or ''}",
         f"confidence: {event.confidence}",
     ]
     if event.time_unknown:
@@ -45,6 +52,10 @@ def build_summary(event: Event) -> str:
 
 
 def build_location(event: Event) -> Optional[str]:
+    """
+    Google Calendar の location は 1フィールドなので、
+    場所名/住所が両方あれば "場所名 / 住所" にして見やすくする。
+    """
     if event.location_name and event.address:
         return f"{event.location_name} / {event.address}"
     return event.location_name or event.address
@@ -118,6 +129,10 @@ def _find_events_by_event_uid(config: Config, event: Event) -> List[Dict[str, An
 
     - q=event_uid で全文検索
     - timeMin/timeMax で日付近辺に絞る（検索精度＆速度UP）
+
+    NOTE:
+      event_uid の仕様を変えたなら、ここも自動でその新UIDで検索される。
+      （Peatixは reservation_id にする前提）
     """
     if not config.yogisync_calendar_id:
         raise ValueError("YOGISYNC_CALENDAR_ID is not set")
