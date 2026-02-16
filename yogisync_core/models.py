@@ -114,6 +114,13 @@ class GmailMessage(BaseModel):
     text_html: Optional[str] = None
 
 
+class YogaDecision(BaseModel):
+    is_yoga: bool
+    confidence: float
+    reason: str
+    matched_signals: list[str]
+
+
 class SyncResult(BaseModel):
     created: int = 0
     updated: int = 0

@@ -13,6 +13,7 @@ from .parsers.mosh import parse_mosh
 from .parsers.life_tuning import parse_life_tuning
 from .store import EventStore
 from .sync_gcal import reconcile_event
+from .yoga_classifier import classify_yoga_event
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,42 @@ def run_sync(config: Config, limit: int = 50) -> SyncResult:
                         (msg.snippet or "")[:80],
                         len(msg.text_plain or ""),
                         len(msg.text_html or ""),
+                    )
+                    result.skipped += 1
+                    continue
+
+                decision = classify_yoga_event(config, msg, event)
+                logger.info(
+                    "yoga_classifier: provider=%s subject=%s title=%s is_yoga=%s confidence=%.2f reason=%s signals=%s",
+                    event.provider,
+                    msg.subject,
+                    event.title,
+                    decision.is_yoga,
+                    decision.confidence,
+                    decision.reason,
+                    decision.matched_signals,
+                )
+
+                is_yoga = decision.is_yoga
+                if is_yoga and decision.confidence < config.yoga_classifier_min_confidence:
+                    is_yoga = False
+                    logger.info(
+                        "yoga_classifier: low confidence -> treat as non-yoga provider=%s subject=%s title=%s confidence=%.2f threshold=%.2f",
+                        event.provider,
+                        msg.subject,
+                        event.title,
+                        decision.confidence,
+                        config.yoga_classifier_min_confidence,
+                    )
+
+                if not is_yoga:
+                    logger.info(
+                        "skip: non-yoga event provider=%s subject=%s title=%s confidence=%.2f reason=%s",
+                        event.provider,
+                        msg.subject,
+                        event.title,
+                        decision.confidence,
+                        decision.reason,
                     )
                     result.skipped += 1
                     continue
