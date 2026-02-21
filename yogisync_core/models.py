@@ -20,9 +20,12 @@ class Event(BaseModel):
     reservation_id: Optional[str] = None
     source_url: Optional[str] = None
 
-    # --- NEW: pricing / options (MOSHなどで使う) ---
-    base_price: Optional[str] = None                 # 例: "¥2500"
-    option_menus: Optional[list[str]] = None         # 例: ["レンタルヨガマット×1(￥200)"]
+    # --- pricing / options (MOSHなど) ---
+    base_price: Optional[str] = None
+    option_menus: Optional[list[str]] = None
+
+    # --- NEW: Peatix ticket types ---
+    ticket_types: list[str] = []
 
     confidence: float = 1.0
     event_uid: str = ""
@@ -90,7 +93,9 @@ class Event(BaseModel):
 
     def content_hash(self) -> str:
         options = self.option_menus or []
-        options_key = "\n".join([str(x) for x in options])  # 順序維持（同じ並びなら同じhash）
+        options_key = "\n".join([str(x) for x in options])  # 順序保持
+
+        tickets_key = "\n".join([str(x) for x in (self.ticket_types or [])])
 
         payload = "|".join(
             [
@@ -104,6 +109,7 @@ class Event(BaseModel):
                 str(self.source_url or ""),
                 str(self.base_price or ""),
                 options_key,
+                tickets_key,
                 f"{self.confidence:.2f}",
                 "1" if self.time_unknown else "0",
             ]

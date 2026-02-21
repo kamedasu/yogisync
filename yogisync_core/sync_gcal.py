@@ -22,13 +22,6 @@ def get_calendar_service(config: Config):
 
 
 def build_description(event: Event) -> str:
-    """
-    カレンダー詳細で “必ず見える” 情報を description に出す。
-
-    - event_uid は ensure_event_uid() の値を採用
-    - reservation_id / instructor / address / source_url は基本表示
-    - mosh等で取れる base_price / option_menus も表示
-    """
     lines = [
         f"provider: {event.provider}",
         f"event_uid: {event.ensure_event_uid()}",
@@ -45,6 +38,11 @@ def build_description(event: Event) -> str:
         lines.append("option_menus:")
         for opt in event.option_menus:
             lines.append(f"- {opt}")
+
+    if event.ticket_types:
+        lines.append("ticket_types:")
+        for t in event.ticket_types:
+            lines.append(f"- {t}")
 
     lines.append(f"confidence: {event.confidence}")
 

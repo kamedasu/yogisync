@@ -158,15 +158,18 @@ def _extract_title_from_body_text(text: str) -> Optional[str]:
 
 
 def _extract_reservation_id(text: str, soup: BeautifulSoup) -> Optional[str]:
+    # 1) JSON-LD があれば最優先
     rid_jsonld, _ = _extract_jsonld(soup)
     if rid_jsonld:
         digits = re.sub(r"\D+", "", rid_jsonld)
         return digits or rid_jsonld
 
+    # 2) regex 直抜き
     m = re.search(r"(確認番号|予約番号)\s*[:：]?\s*([0-9]{5,})", text)
     if m:
         return m.group(2)
 
+    # 3) ラベル＋次行
     rid = first_non_empty(
         _extract_line_after(text, "確認番号"),
         _extract_line_after(text, "予約番号"),
@@ -204,7 +207,6 @@ def _extract_address(text: str, soup: BeautifulSoup) -> Optional[str]:
 # URL extraction (final)
 # ----------------------------
 
-# 除外したい “汎用/案内/配信用” ドメインやパス
 _EXCLUDED_PREFIXES = (
     "https://help.peatix.com/",
     "http://help.peatix.com/",
@@ -225,8 +227,10 @@ _EXCLUDED_PATH_KEYWORDS = (
     "/portal",
 )
 
-# 期待値：イベント用サブドメイン
-_EVENT_SUBDOMAIN_RE = re.compile(r"^https?://(?!about\.|help\.|cdn\.|t\.)[a-z0-9][a-z0-9-]*\.peatix\.com/?$", re.I)
+_EVENT_SUBDOMAIN_RE = re.compile(
+    r"^https?://(?!about\.|help\.|cdn\.|t\.)[a-z0-9][a-z0-9-]*\.peatix\.com/?$",
+    re.I,
+)
 
 
 def _normalize_url(url: str) -> str:
@@ -242,7 +246,6 @@ def _is_excluded_url(url: str) -> bool:
     for p in _EXCLUDED_PREFIXES:
         if u.startswith(p):
             return True
-    # peatix.com の pricing/about/help なども除外
     for kw in _EXCLUDED_PATH_KEYWORDS:
         if kw in u:
             return True
@@ -251,8 +254,7 @@ def _is_excluded_url(url: str) -> bool:
 
 def _score_peatix_url(url: str) -> int:
     """
-    “イベントページっぽさ”でスコアリング。
-    高いほど優先。
+    “イベントページっぽさ”でスコアリング。高いほど優先。
     """
     u = _normalize_url(url)
     if _is_excluded_url(u):
@@ -279,7 +281,6 @@ def _score_peatix_url(url: str) -> int:
     if u.startswith("https://"):
         score += 5
 
-    # URLが短すぎる(=汎用)のを少し減点
     if len(u) < 25:
         score -= 50
 
@@ -293,7 +294,6 @@ def _extract_urls_from_raw(raw: str) -> List[str]:
     if not raw:
         return []
     urls = re.findall(r"https?://[^\s\"'<>()]+", raw)
-    # 末尾の記号を軽く除去
     cleaned: List[str] = []
     for u in urls:
         u2 = u.rstrip(".,);]")
@@ -306,7 +306,9 @@ def _extract_peatix_url(soup: BeautifulSoup, raw_html: str, text: str) -> Option
     source_url は「イベントページURL」を入れる。
 
     優先順位:
-      - HTML/テキスト内の直書き含め候補を全部集める
+      - JSON-LD url
+      - anchors
+      - raw html / text の直書きURL
       - “イベント用サブドメイン” を最優先で採用（spinetwistcurryyoga0211.peatix.com など）
       - それが無い場合に peatix.com/event/ を採用
       - t.peatix / cdn / about / help / pricing は除外
@@ -325,11 +327,11 @@ def _extract_peatix_url(soup: BeautifulSoup, raw_html: str, text: str) -> Option
         if href:
             candidates.append(href)
 
-    # raw html / text から直書きURLも拾う
+    # raw html / text
     candidates.extend(_extract_urls_from_raw(raw_html))
     candidates.extend(_extract_urls_from_raw(text))
 
-    # peatix関連だけに寄せる（ノイズ削減）
+    # peatixだけ残す
     candidates = [c for c in candidates if "peatix.com" in c]
 
     best_url: Optional[str] = None
@@ -345,6 +347,49 @@ def _extract_peatix_url(soup: BeautifulSoup, raw_html: str, text: str) -> Option
 
 
 # ----------------------------
+# Ticket types extraction (NEW)
+# ----------------------------
+
+def _extract_ticket_types_from_peatix_order_table(soup: BeautifulSoup) -> List[str]:
+    """
+    Peatixメールの注文テーブル（order-table）の「チケット種別」列（通常1列目）を抽出する。
+    例:
+      □参加チケット2,500円（当日現金払い）
+      □雨天時ヨガとカレーランチ参加チケット2,000円(当日現金払い）
+    """
+    tickets: List[str] = []
+
+    table = soup.find("table", class_="order-table")
+    if not table:
+        return tickets
+
+    tbody = table.find("tbody")
+    if not tbody:
+        return tickets
+
+    for tr in tbody.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+
+        raw = tds[0].get_text(" ", strip=True)
+        raw = re.sub(r"\s+", " ", raw).strip()
+        if raw:
+            tickets.append(raw)
+
+    # 重複排除（順序維持）
+    uniq: List[str] = []
+    seen = set()
+    for t in tickets:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+
+    return uniq
+
+
+# ----------------------------
 # Main parser
 # ----------------------------
 
@@ -355,9 +400,10 @@ def parse_peatix(msg: GmailMessage) -> Optional[Event]:
 
     取りたいもの:
       - title: イベント名
-      - reservation_id: 確認番号
-      - address: 住所
+      - reservation_id: 確認番号（JSON-LD優先）
+      - address: 住所（JSON-LD優先）
       - source_url: イベントページURL（例: https://xxxx.peatix.com/）
+      - ticket_types: チケット種別（order-tableから）
     """
     html = msg.text_html or ""
     if not html:
@@ -387,7 +433,11 @@ def parse_peatix(msg: GmailMessage) -> Optional[Event]:
     address = _extract_address(text, soup)
     reservation_id = _extract_reservation_id(text, soup)
 
+    # ← ここが肝：help/about/t.peatix を弾いて、イベントURLを選ぶ
     source_url = _extract_peatix_url(soup, raw_html=html, text=text)
+
+    # NEW: チケット種別
+    ticket_types = _extract_ticket_types_from_peatix_order_table(soup)
 
     return Event(
         provider="peatix",
@@ -398,5 +448,6 @@ def parse_peatix(msg: GmailMessage) -> Optional[Event]:
         instructor=None,
         reservation_id=reservation_id,
         source_url=source_url,
+        ticket_types=ticket_types,
         confidence=1.0 if title and reservation_id else 0.9,
     )
