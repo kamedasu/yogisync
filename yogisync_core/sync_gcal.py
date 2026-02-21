@@ -10,9 +10,6 @@ from .auth import get_credentials
 from .config import Config
 from .models import Event
 
-# NOTE:
-# token.json を 1つで運用しているなら、モジュールごとに scope がズレると 403 になりがちなので
-# Gmail/Calendar 両方を入れておくのが安全（あなたの運用に合わせている）
 SCOPES_CAL = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar",
@@ -28,10 +25,9 @@ def build_description(event: Event) -> str:
     """
     カレンダー詳細で “必ず見える” 情報を description に出す。
 
-    - event_uid は ensure_event_uid() の値を採用（Peatixは reservation_id を優先）
-    - reservation_id は確認番号/予約番号が入る想定
-    - instructor が取れる provider は instructor も表示（BONNEなど）
-    - address も表示（メールにある住所を活かす）
+    - event_uid は ensure_event_uid() の値を採用
+    - reservation_id / instructor / address / source_url は基本表示
+    - mosh等で取れる base_price / option_menus も表示
     """
     lines = [
         f"provider: {event.provider}",
@@ -40,10 +36,21 @@ def build_description(event: Event) -> str:
         f"instructor: {event.instructor or ''}",
         f"source_url: {event.source_url or ''}",
         f"address: {event.address or ''}",
-        f"confidence: {event.confidence}",
     ]
+
+    if event.base_price:
+        lines.append(f"base_price: {event.base_price}")
+
+    if event.option_menus:
+        lines.append("option_menus:")
+        for opt in event.option_menus:
+            lines.append(f"- {opt}")
+
+    lines.append(f"confidence: {event.confidence}")
+
     if event.time_unknown:
         lines.append("time_unknown: true (needs confirmation)")
+
     return "\n".join(lines)
 
 
@@ -56,20 +63,12 @@ def build_summary(event: Event) -> str:
 
 
 def build_location(event: Event) -> Optional[str]:
-    """
-    Google Calendar の location は 1フィールドなので、
-    場所名/住所が両方あれば "場所名 / 住所" にして見やすくする。
-    """
     if event.location_name and event.address:
         return f"{event.location_name} / {event.address}"
     return event.location_name or event.address
 
 
 def _ensure_tz_aware(dt, tz_name: str):
-    """
-    Google Calendar API の timeMin/timeMax は RFC3339（タイムゾーン付き）必須。
-    dt が naive の場合は tz_name を付与し、aware の場合は tz_name に変換する。
-    """
     tz = ZoneInfo(tz_name)
     if getattr(dt, "tzinfo", None) is None:
         return dt.replace(tzinfo=tz)
@@ -81,9 +80,6 @@ def _to_rfc3339(dt, tz_name: str) -> str:
 
 
 def _build_gcal_time_range(config: Config, event: Event) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """
-    Google Calendar API の start/end フォーマットを組み立てる
-    """
     if event.time_unknown:
         start_date = event.date.date()
         end_date = start_date + timedelta(days=1)
@@ -116,10 +112,6 @@ def _build_event_body(config: Config, event: Event) -> Dict[str, Any]:
 
 
 def upsert_event(config: Config, event: Event, gcal_event_id: Optional[str]) -> str:
-    """
-    既存の eventId が分かっている場合：update
-    無い場合：insert
-    """
     if not config.yogisync_calendar_id:
         raise ValueError("YOGISYNC_CALENDAR_ID is not set")
 
@@ -143,25 +135,17 @@ def upsert_event(config: Config, event: Event, gcal_event_id: Optional[str]) -> 
 
 
 def _find_events_by_event_uid(config: Config, event: Event) -> List[Dict[str, Any]]:
-    """
-    description に入っている event_uid をキーに、該当イベントを検索して返す。
-
-    - q=event_uid で全文検索
-    - timeMin/timeMax で日付近辺に絞る（検索精度＆速度UP）
-    """
     if not config.yogisync_calendar_id:
         raise ValueError("YOGISYNC_CALENDAR_ID is not set")
 
     service = get_calendar_service(config)
     event_uid = event.ensure_event_uid()
 
-    # 日付周辺だけを見る（大きいカレンダーだと重要）
     if event.time_unknown:
         center = event.date.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         center = event.date
 
-    # ★RFC3339（TZ付き）に統一
     time_min = _to_rfc3339(center - timedelta(days=7), config.timezone)
     time_max = _to_rfc3339(center + timedelta(days=7), config.timezone)
 
@@ -197,12 +181,6 @@ def _find_events_by_event_uid(config: Config, event: Event) -> List[Dict[str, An
 
 
 def _choose_keep_event_id(events: List[Dict[str, Any]]) -> str:
-    """
-    重複がある場合に「残す1件」を決める。
-    - updated が新しいものを優先
-    - updated が無ければ id の辞書順
-    """
-
     def key(it: Dict[str, Any]) -> Tuple[str, str]:
         return (it.get("updated") or "", it.get("id") or "")
 
@@ -223,9 +201,6 @@ def reconcile_event(
     allow_create: bool = True,
     cleanup_duplicates: bool = True,
 ) -> Optional[str]:
-    """
-    “重複しない” を強制するための統合関数。
-    """
     if not config.yogisync_calendar_id:
         raise ValueError("YOGISYNC_CALENDAR_ID is not set")
 
@@ -264,7 +239,6 @@ def reconcile_event(
         )
         return updated.get("id")
 
-    keep_id: str
     if stored_gcal_event_id and stored_in_found:
         keep_id = stored_gcal_event_id
     else:

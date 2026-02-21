@@ -19,6 +19,11 @@ class Event(BaseModel):
     instructor: Optional[str] = None
     reservation_id: Optional[str] = None
     source_url: Optional[str] = None
+
+    # --- NEW: pricing / options (MOSHなどで使う) ---
+    base_price: Optional[str] = None                 # 例: "¥2500"
+    option_menus: Optional[list[str]] = None         # 例: ["レンタルヨガマット×1(￥200)"]
+
     confidence: float = 1.0
     event_uid: str = ""
     gcal_event_id: Optional[str] = None
@@ -71,22 +76,22 @@ class Event(BaseModel):
         else:
             date_key = self.date.replace(second=0, microsecond=0).isoformat()
 
-        # できるだけ安定させたいので、titleは基本入れない方針
-        # （ただし、他providerで予約番号やURLが無い場合は識別が難しいので、
-        #  location_name があれば足す。titleは入れない）
+        # title は基本入れない（変更でUIDが変わるのを避ける）
         if self.location_name:
             location_key = self.location_name.strip()
             base_uid = f"{provider}:{date_key}:{location_key}"
         else:
             base_uid = f"{provider}:{date_key}"
 
-        # 万が一同日時で衝突する可能性があるので、最後にhash短縮を保険で付ける
-        # ただし、毎回変わると困るので content_hash() を使う（内容が同じなら同じ）
+        # 衝突保険として hash を付ける
         short_hash = self.content_hash()[:12]
         self.event_uid = f"{base_uid}:{short_hash}"
         return self.event_uid
 
     def content_hash(self) -> str:
+        options = self.option_menus or []
+        options_key = "\n".join([str(x) for x in options])  # 順序維持（同じ並びなら同じhash）
+
         payload = "|".join(
             [
                 self.provider,
@@ -97,6 +102,8 @@ class Event(BaseModel):
                 str(self.instructor or ""),
                 str(self.reservation_id or ""),
                 str(self.source_url or ""),
+                str(self.base_price or ""),
+                options_key,
                 f"{self.confidence:.2f}",
                 "1" if self.time_unknown else "0",
             ]
