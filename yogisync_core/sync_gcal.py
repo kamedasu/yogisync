@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import Optional, List, Dict, Any, Tuple
+from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
 
@@ -59,6 +60,22 @@ def build_location(event: Event) -> Optional[str]:
     if event.location_name and event.address:
         return f"{event.location_name} / {event.address}"
     return event.location_name or event.address
+
+
+def _ensure_tz_aware(dt, tz_name: str):
+    """
+    Google Calendar API の timeMin/timeMax は RFC3339（タイムゾーン付き）必須。
+    dt が naive の場合は tz_name を付与し、aware の場合は tz_name に変換する。
+    """
+    tz = ZoneInfo(tz_name)
+    if getattr(dt, "tzinfo", None) is None:
+        # naive は “ローカル時間” とみなして tz を付与
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
+def _to_rfc3339(dt, tz_name: str) -> str:
+    return _ensure_tz_aware(dt, tz_name).isoformat()
 
 
 def _build_gcal_time_range(config: Config, event: Event) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -147,8 +164,9 @@ def _find_events_by_event_uid(config: Config, event: Event) -> List[Dict[str, An
     else:
         center = event.date
 
-    time_min = (center - timedelta(days=7)).isoformat()
-    time_max = (center + timedelta(days=7)).isoformat()
+    # ★ここが今回の本丸：Google Calendar API の timeMin/timeMax は RFC3339（TZ付き）必須
+    time_min = _to_rfc3339(center - timedelta(days=7), config.timezone)
+    time_max = _to_rfc3339(center + timedelta(days=7), config.timezone)
 
     items: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
@@ -189,6 +207,7 @@ def _choose_keep_event_id(events: List[Dict[str, Any]]) -> str:
     - updated が新しいものを優先
     - updated が無ければ id の辞書順
     """
+
     def key(it: Dict[str, Any]) -> Tuple[str, str]:
         return (it.get("updated") or "", it.get("id") or "")
 
