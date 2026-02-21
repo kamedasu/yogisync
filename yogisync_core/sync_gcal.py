@@ -27,14 +27,17 @@ def get_calendar_service(config: Config):
 def build_description(event: Event) -> str:
     """
     カレンダー詳細で “必ず見える” 情報を description に出す。
-    - event_uid は ensure_event_uid() の値を採用（Peatixは reservation_id にする）
-    - reservation_id は確認番号が入る想定
+
+    - event_uid は ensure_event_uid() の値を採用（Peatixは reservation_id を優先）
+    - reservation_id は確認番号/予約番号が入る想定
+    - instructor が取れる provider は instructor も表示（BONNEなど）
     - address も表示（メールにある住所を活かす）
     """
     lines = [
         f"provider: {event.provider}",
         f"event_uid: {event.ensure_event_uid()}",
         f"reservation_id: {event.reservation_id or ''}",
+        f"instructor: {event.instructor or ''}",
         f"source_url: {event.source_url or ''}",
         f"address: {event.address or ''}",
         f"confidence: {event.confidence}",
@@ -69,7 +72,6 @@ def _ensure_tz_aware(dt, tz_name: str):
     """
     tz = ZoneInfo(tz_name)
     if getattr(dt, "tzinfo", None) is None:
-        # naive は “ローカル時間” とみなして tz を付与
         return dt.replace(tzinfo=tz)
     return dt.astimezone(tz)
 
@@ -146,10 +148,6 @@ def _find_events_by_event_uid(config: Config, event: Event) -> List[Dict[str, An
 
     - q=event_uid で全文検索
     - timeMin/timeMax で日付近辺に絞る（検索精度＆速度UP）
-
-    NOTE:
-      event_uid の仕様を変えたなら、ここも自動でその新UIDで検索される。
-      （Peatixは reservation_id にする前提）
     """
     if not config.yogisync_calendar_id:
         raise ValueError("YOGISYNC_CALENDAR_ID is not set")
@@ -159,12 +157,11 @@ def _find_events_by_event_uid(config: Config, event: Event) -> List[Dict[str, An
 
     # 日付周辺だけを見る（大きいカレンダーだと重要）
     if event.time_unknown:
-        # all-day は date ベースなので、前後数日で十分
         center = event.date.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         center = event.date
 
-    # ★ここが今回の本丸：Google Calendar API の timeMin/timeMax は RFC3339（TZ付き）必須
+    # ★RFC3339（TZ付き）に統一
     time_min = _to_rfc3339(center - timedelta(days=7), config.timezone)
     time_max = _to_rfc3339(center + timedelta(days=7), config.timezone)
 
@@ -190,7 +187,6 @@ def _find_events_by_event_uid(config: Config, event: Event) -> List[Dict[str, An
         if not page_token:
             break
 
-    # 念のため「本当に event_uid を含む」ものに絞る（q検索は緩いことがある）
     filtered: List[Dict[str, Any]] = []
     for it in items:
         desc = it.get("description") or ""
@@ -203,7 +199,6 @@ def _find_events_by_event_uid(config: Config, event: Event) -> List[Dict[str, An
 def _choose_keep_event_id(events: List[Dict[str, Any]]) -> str:
     """
     重複がある場合に「残す1件」を決める。
-    ざっくり安定するように：
     - updated が新しいものを優先
     - updated が無ければ id の辞書順
     """
@@ -214,7 +209,6 @@ def _choose_keep_event_id(events: List[Dict[str, Any]]) -> str:
     events_sorted = sorted(events, key=key, reverse=True)
     keep_id = events_sorted[0].get("id")
     if not keep_id:
-        # 理論上ほぼ無いが保険
         keep_id = events[0].get("id")
     if not keep_id:
         raise ValueError("Could not determine keep event id (missing id)")
@@ -231,15 +225,6 @@ def reconcile_event(
 ) -> Optional[str]:
     """
     “重複しない” を強制するための統合関数。
-
-    1) Calendar 側に event_uid が存在するか検索
-    2) 1件なら update（または stored id があればそれ優先で update）
-    3) 複数件なら、残す1件を決めて他は delete（cleanup_duplicates=True の場合）
-    4) 0件なら insert（allow_create=True の場合）
-
-    戻り値:
-      - 最終的に採用した gcal_event_id（作成/更新/保持）
-      - allow_create=False で 0件なら None
     """
     if not config.yogisync_calendar_id:
         raise ValueError("YOGISYNC_CALENDAR_ID is not set")
@@ -247,10 +232,8 @@ def reconcile_event(
     service = get_calendar_service(config)
     body = _build_event_body(config, event)
 
-    # まず event_uid で検索（既存を拾う）
     found = _find_events_by_event_uid(config, event)
 
-    # 既にDBにgcal_event_idがあるなら、それが found の中にあるかも見る
     stored_in_found = False
     if stored_gcal_event_id:
         for it in found:
@@ -258,7 +241,6 @@ def reconcile_event(
                 stored_in_found = True
                 break
 
-    # 0件：新規作成（許可されていれば）
     if not found:
         if not allow_create:
             return None
@@ -269,12 +251,10 @@ def reconcile_event(
         )
         return created.get("id")
 
-    # 1件：それを update（ただし stored id があるなら stored を優先）
     if len(found) == 1:
         existing_id = found[0].get("id")
         target_id = stored_gcal_event_id or existing_id
         if not target_id:
-            # 保険
             target_id = existing_id
 
         updated = (
@@ -284,7 +264,6 @@ def reconcile_event(
         )
         return updated.get("id")
 
-    # 複数件：重複掃除
     keep_id: str
     if stored_gcal_event_id and stored_in_found:
         keep_id = stored_gcal_event_id
@@ -298,7 +277,6 @@ def reconcile_event(
                 continue
             service.events().delete(calendarId=config.yogisync_calendar_id, eventId=eid).execute()
 
-    # 残す1件を最新情報で update
     updated = (
         service.events()
         .update(calendarId=config.yogisync_calendar_id, eventId=keep_id, body=body)
