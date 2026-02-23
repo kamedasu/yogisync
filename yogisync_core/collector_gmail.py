@@ -14,11 +14,22 @@ SCOPES_GMAIL = [
     "https://www.googleapis.com/auth/calendar",
 ]
 
+
 def _decode_body(data: str) -> str:
     try:
         return base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="replace")
     except Exception:
         return ""
+
+
+def _decode_raw_rfc822(raw_b64: Optional[str]) -> Optional[str]:
+    if not raw_b64:
+        return None
+    try:
+        # Gmail API format=raw は base64url encoded RFC822
+        return base64.urlsafe_b64decode(raw_b64.encode("utf-8")).decode("utf-8", errors="replace")
+    except Exception:
+        return None
 
 
 def _extract_parts(payload: Dict) -> Tuple[Optional[str], Optional[str]]:
@@ -67,16 +78,29 @@ def fetch_messages(config: Config, limit: int = 50) -> List[GmailMessage]:
     fetched = 0
 
     while True:
-        req = service.users().messages().list(userId=user_id, q=query, maxResults=min(500, limit - fetched), pageToken=page_token)
+        req = service.users().messages().list(
+            userId=user_id,
+            q=query,
+            maxResults=min(500, limit - fetched),
+            pageToken=page_token,
+        )
         resp = req.execute()
+
         for msg in resp.get("messages", []) or []:
             msg_id = msg.get("id")
             if not msg_id:
                 continue
+
+            # 1) 既存どおり full を取得（payload/headers/snippet 用）
             full = service.users().messages().get(userId=user_id, id=msg_id, format="full").execute()
             payload = full.get("payload", {})
             headers = _parse_headers(payload.get("headers", []) or [])
             text_plain, text_html = _extract_parts(payload)
+
+            # 2) NEW: raw MIME を取得（LIFE TUNING source_url復元用）
+            raw_resp = service.users().messages().get(userId=user_id, id=msg_id, format="raw").execute()
+            raw_rfc822 = _decode_raw_rfc822(raw_resp.get("raw"))
+
             messages.append(
                 GmailMessage(
                     id=msg_id,
@@ -86,8 +110,10 @@ def fetch_messages(config: Config, limit: int = 50) -> List[GmailMessage]:
                     snippet=full.get("snippet"),
                     text_plain=text_plain,
                     text_html=text_html,
+                    raw_rfc822=raw_rfc822,
                 )
             )
+
             fetched += 1
             if fetched >= limit:
                 return messages

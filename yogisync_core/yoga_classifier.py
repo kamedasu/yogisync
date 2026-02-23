@@ -184,6 +184,25 @@ def _parse_error_keywords(value: str) -> list[str]:
     return [t.strip().lower() for t in value.split(",") if t.strip()]
 
 
+def _parse_provider_list(value: str) -> set[str]:
+    return {p.strip().lower() for p in (value or "").split(",") if p.strip()}
+
+
+def _is_target_provider(config: Config, provider: str) -> bool:
+    """
+    envで判定対象providerを絞る。
+    例:
+      YOGA_CLASSIFIER_TARGET_PROVIDERS=peatix,mosh
+
+    未設定/空の場合は「全provider対象」（後方互換）。
+    """
+    raw = getattr(config, "yoga_classifier_target_providers", "") or ""
+    targets = _parse_provider_list(raw)
+    if not targets:
+        return True
+    return (provider or "").strip().lower() in targets
+
+
 def _is_api_unavailable_error(config: Config, exc: Exception) -> bool:
     msg = str(exc).lower()
     for kw in _parse_error_keywords(config.yoga_classifier_keyword_fallback_on_errors):
@@ -217,15 +236,56 @@ def _keyword_fallback_decision(
 
 
 def classify_yoga_event(config: Config, msg: GmailMessage, event: Event) -> YogaDecision:
-    if not config.yoga_classifier_enabled:
-        return YogaDecision(
+    # --- DEBUG LOG: target provider 判定の見える化 ---
+    raw_targets = getattr(config, "yoga_classifier_target_providers", "") or ""
+    is_target = _is_target_provider(config, event.provider)
+    logger.info(
+        "yoga_classifier: target_providers_raw=%r provider=%s is_target=%s",
+        raw_targets,
+        event.provider,
+        is_target,
+    )
+
+    # --- NEW: provider単位で判定対象を制御 ---
+    if not is_target:
+        decision = YogaDecision(
             is_yoga=True,
             confidence=1.0,
-            reason="classifier disabled; treated as yoga",
-            matched_signals=["disabled"],
+            reason=f"provider '{event.provider}' not targeted; treated as yoga",
+            matched_signals=["provider_not_targeted"],
         )
+        logger.info("yoga_classifier: route=provider_bypass provider=%s", event.provider)
+        return decision
+    # --- NEW END ---
+
+    # AI無効時は「全部ヨガ扱い」ではなくキーワード判定へ
+    if not config.yoga_classifier_enabled:
+        if config.yoga_classifier_keyword_fallback_enabled:
+            decision = _keyword_fallback_decision(
+                config,
+                msg,
+                event,
+                "classifier disabled; keyword fallback",
+            )
+            logger.info("yoga_classifier: route=keyword_fallback (disabled)")
+            return decision
+
+        decision = _decision_from_error(config, "classifier disabled (keyword fallback disabled)")
+        logger.info(
+            "yoga_classifier: route=fail_open" if decision.is_yoga else "yoga_classifier: route=fail_closed"
+        )
+        return decision
 
     if not config.openai_api_key:
+        if config.yoga_classifier_keyword_fallback_enabled:
+            decision = _keyword_fallback_decision(
+                config,
+                msg,
+                event,
+                "missing OPENAI_API_KEY; keyword fallback",
+            )
+            logger.info("yoga_classifier: route=keyword_fallback (missing_key)")
+            return decision
         return _decision_from_error(config, "missing OPENAI_API_KEY")
 
     client = OpenAI(api_key=config.openai_api_key)
@@ -254,7 +314,6 @@ def classify_yoga_event(config: Config, msg: GmailMessage, event: Event) -> Yoga
                 logger.info("yoga_classifier: route=responses")
                 return decision
             except TypeError as exc:
-                # Fallback when response_format or Responses API kwargs are not supported.
                 logger.info("yoga_classifier: responses fallback: %s", exc)
                 try:
                     decision = _call_chat_completions_tools(
@@ -269,7 +328,7 @@ def classify_yoga_event(config: Config, msg: GmailMessage, event: Event) -> Yoga
                     )
                     logger.info("yoga_classifier: route=json_object")
                     return decision
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             last_err = exc
             if _is_api_unavailable_error(config, exc):
                 if config.yoga_classifier_keyword_fallback_enabled:
@@ -282,7 +341,9 @@ def classify_yoga_event(config: Config, msg: GmailMessage, event: Event) -> Yoga
                     logger.info("yoga_classifier: route=keyword_fallback")
                     return decision
                 decision = _decision_from_error(config, "api unavailable (keyword fallback disabled)")
-                logger.info("yoga_classifier: route=fail_open" if decision.is_yoga else "yoga_classifier: route=fail_closed")
+                logger.info(
+                    "yoga_classifier: route=fail_open" if decision.is_yoga else "yoga_classifier: route=fail_closed"
+                )
                 return decision
             if attempt == 0:
                 time.sleep(0.5)

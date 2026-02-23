@@ -37,6 +37,11 @@ class Config:
     yoga_classifier_keyword_fallback_terms: str
     yoga_classifier_keyword_fallback_on_errors: str
 
+    # --- NEW: 判定対象provider（カンマ区切り） ---
+    # 例: "peatix,mosh"
+    # 空文字なら全provider対象（後方互換）
+    yoga_classifier_target_providers: str
+
 
 def _parse_bool(value: Optional[str], default: bool) -> bool:
     if value is None:
@@ -136,6 +141,13 @@ def load_config(source: Optional[SettingsSource] = None, dotenv_path: Optional[s
         or "insufficient_quota,rate_limit"
     )
 
+    # --- NEW ---
+    yoga_classifier_target_providers = (
+        src.get("YOGA_CLASSIFIER_TARGET_PROVIDERS")
+        or src.get("yoga_classifier_target_providers")
+        or ""
+    )
+
     return Config(
         gmail_query=gmail_query,
         google_client_secret_path=google_client_secret_path,
@@ -153,4 +165,5 @@ def load_config(source: Optional[SettingsSource] = None, dotenv_path: Optional[s
         yoga_classifier_keyword_fallback_enabled=yoga_classifier_keyword_fallback_enabled,
         yoga_classifier_keyword_fallback_terms=yoga_classifier_keyword_fallback_terms,
         yoga_classifier_keyword_fallback_on_errors=yoga_classifier_keyword_fallback_on_errors,
+        yoga_classifier_target_providers=yoga_classifier_target_providers,  # --- NEW ---
     )

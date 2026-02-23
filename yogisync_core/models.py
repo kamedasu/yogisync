@@ -126,6 +126,9 @@ class GmailMessage(BaseModel):
     text_plain: Optional[str] = None
     text_html: Optional[str] = None
 
+    # NEW: Gmail API format=raw のRFC822文字列（LIFE TUNINGのsource_url復元用）
+    raw_rfc822: Optional[str] = None
+
 
 class YogaDecision(BaseModel):
     is_yoga: bool
