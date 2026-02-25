@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import quopri
 import re
 from datetime import datetime
@@ -10,6 +11,7 @@ from bs4 import BeautifulSoup
 from ..models import Event, GmailMessage
 from . import extract_label_value, parse_first_datetime, first_non_empty
 
+logger = logging.getLogger(__name__)
 
 # ----------------------------
 # URL / text patterns
@@ -55,6 +57,10 @@ _JP_DATE_WITH_TITLE_HEAD_RE = re.compile(
     r"^\s*(\d{1,2})月(\d{1,2})日\s*[（(][月火水木金土日][)）]\s*(.+?)\s*$"
 )
 
+# NEW: 例: 9/29(月）呼吸を感じるリラックスヨガ ... × 1（時間なし・同一行にタイトル）
+_DATE_MMDD_WITH_TITLE_HEAD_RE = re.compile(
+    r"^\s*(\d{1,2})/(\d{1,2})\s*[（(][月火水木金土日][)）]\s*(.+?)\s*$"
+)
 
 # ----------------------------
 # basic helpers
@@ -132,6 +138,28 @@ def _is_noise_title_line(s: str) -> bool:
     return any(k in s2 for k in ng_keywords)
 
 
+def _debug_excerpt(s: Optional[str], max_len: int = 220) -> str:
+    if not s:
+        return ""
+    t = re.sub(r"\s+", " ", s).strip()
+    if len(t) <= max_len:
+        return t
+    return t[:max_len] + "..."
+
+
+def _dump_lines_context(lines: List[str], anchor: int, *, before: int = 5, after: int = 25) -> List[str]:
+    """
+    アンカー周辺の行を見やすい形で返す。
+    """
+    start = max(0, anchor - before)
+    end = min(len(lines), anchor + after + 1)
+    out: List[str] = []
+    for idx in range(start, end):
+        prefix = ">>" if idx == anchor else "  "
+        out.append(f"{prefix}{idx:03d}: {lines[idx]}")
+    return out
+
+
 # ----------------------------
 # quoted-printable helpers (for URL recovery)
 # ----------------------------
@@ -188,13 +216,19 @@ def _extract_source_url(text: str, soup: Optional[BeautifulSoup], raw_rfc822: Op
     ]
 
     # 1) account URL 直接
-    for src in scan_targets:
+    for idx, src in enumerate(scan_targets):
         m = _ACCOUNT_ORDER_RE.search(src)
         if m:
-            return _canonical_order_url_from_hash(m.group(1))
+            url = _canonical_order_url_from_hash(m.group(1))
+            logger.info(
+                "life_tuning.parse debug: source_url matched account_url target_index=%s url=%s",
+                idx,
+                url,
+            )
+            return url
 
     # 2) Shopify auth URL -> hash 抽出 -> canonical
-    for src in scan_targets:
+    for idx, src in enumerate(scan_targets):
         m = _SHOPIFY_AUTH_HASH_RE.search(src)
         if not m:
             continue
@@ -205,8 +239,24 @@ def _extract_source_url(text: str, soup: Optional[BeautifulSoup], raw_rfc822: Op
         order_hash = order_hash.strip()
 
         if re.fullmatch(r"[a-f0-9]{20,}", order_hash, re.I):
-            return _canonical_order_url_from_hash(order_hash)
+            url = _canonical_order_url_from_hash(order_hash)
+            logger.info(
+                "life_tuning.parse debug: source_url matched shopify_auth target_index=%s hash_len=%s url=%s",
+                idx,
+                len(order_hash),
+                url,
+            )
+            return url
 
+        logger.info(
+            "life_tuning.parse debug: source_url shopify_auth found but invalid hash target_index=%s raw_hash_excerpt=%s normalized_hash_excerpt=%s normalized_hash_len=%s",
+            idx,
+            _debug_excerpt(raw_hash, 120),
+            _debug_excerpt(order_hash, 120),
+            len(order_hash),
+        )
+
+    logger.info("life_tuning.parse debug: source_url not found")
     return None
 
 
@@ -222,10 +272,18 @@ def _extract_map_url(text: str, soup: Optional[BeautifulSoup], raw_rfc822: Optio
         _qp_normalize_for_url_scan(html_raw or ""),
     ]
 
-    for src in scan_targets:
+    for idx, src in enumerate(scan_targets):
         m = _MAP_URL_RE.search(src)
         if m:
-            return _normalize_url(m.group(0))
+            url = _normalize_url(m.group(0))
+            logger.info(
+                "life_tuning.parse debug: map_url matched target_index=%s url=%s",
+                idx,
+                url,
+            )
+            return url
+
+    logger.info("life_tuning.parse debug: map_url not found")
     return None
 
 
@@ -319,20 +377,14 @@ def _extract_price_option(text: str) -> Optional[list[str]]:
 def _extract_date_title_from_order_section(text: str) -> Tuple[Optional[datetime], Optional[str], bool]:
     """
     LIFE TUNING の注文概要から date/title を抽出する。
-    対応パターン:
-      A) 1行型:
-         2/20（金）19:30 ～ 温め、ゆるめるヨガ × 1
-      B) 複数行型（時間あり）:
-         2/20（金）19:30
-         温め、ゆるめるヨガ
-         × 1
-      C) 複数行型（時間なし、同じ行にタイトル前半あり）:
-         1月17日（土）Inner Change, New Beginning
-         ～変化が開く、新しい私～【上崎菜保子 /EMIANA コラボレーションクラス】 × 1
-    戻り値:
-      (date, title, time_unknown)
     """
     lines = _normalize_lines(text)
+
+    logger.info(
+        "life_tuning.parse debug: date_title_scan start lines=%s first_lines=%s",
+        len(lines),
+        lines[:10],
+    )
 
     # 0) まず1行型を全体探索（時間あり）
     for ln in lines:
@@ -346,6 +398,12 @@ def _extract_date_title_from_order_section(text: str) -> Tuple[Optional[datetime
             y = _guess_year(month, day)
             try:
                 dt = datetime(y, month, day, hour, minute)
+                logger.info(
+                    "life_tuning.parse debug: date_title matched pattern=A(one_line) line=%s parsed_date=%s title=%s",
+                    ln,
+                    dt.isoformat(),
+                    title,
+                )
                 return dt, title, False
             except ValueError:
                 pass
@@ -362,6 +420,13 @@ def _extract_date_title_from_order_section(text: str) -> Tuple[Optional[datetime
             ranges.append((max(0, i - 5), min(len(lines), i + 50)))
     else:
         ranges.append((0, len(lines)))
+
+    logger.info("life_tuning.parse debug: date_title anchors=%s ranges=%s", anchors[:10], ranges[:10])
+
+    if anchors:
+        for a in anchors[:5]:
+            dump = _dump_lines_context(lines, a, before=5, after=25)
+            logger.info("life_tuning.parse debug: anchor_context anchor=%s\n%s", a, "\n".join(dump))
 
     for start, end in ranges:
         for i in range(start, end):
@@ -383,26 +448,29 @@ def _extract_date_title_from_order_section(text: str) -> Tuple[Optional[datetime
 
                 if dt:
                     parts: List[str] = []
+                    scanned_lines: List[str] = []
                     for j in range(i + 1, min(i + 8, end)):
                         cand_raw = lines[j]
+                        scanned_lines.append(cand_raw)
                         cand = cand_raw.strip("～〜- ").strip()
-
-                        # ×1 のみなら終端
                         if re.fullmatch(r"[×xX]\s*\d+", cand_raw):
                             break
-
                         if _is_noise_title_line(cand):
                             continue
-
                         cand = re.sub(r"\s*[×xX]\s*\d+\s*$", "", cand).strip()
                         cand = cand.strip("～〜- ").strip()
                         if cand and not _is_noise_title_line(cand):
                             parts.append(cand)
-
                         if "×" in cand_raw:
                             break
-
                     title = " ".join([p for p in parts if p]).strip() or None
+                    logger.info(
+                        "life_tuning.parse debug: date_title matched pattern=B(time_multiline) line=%s scanned_lines=%s parsed_date=%s title=%s",
+                        ln,
+                        scanned_lines,
+                        dt.isoformat(),
+                        title,
+                    )
                     return dt, title, False
 
             # B) 時間なし日付行だけ（次行以降にタイトル）
@@ -419,33 +487,37 @@ def _extract_date_title_from_order_section(text: str) -> Tuple[Optional[datetime
 
                 if dt:
                     parts: List[str] = []
+                    scanned_lines: List[str] = []
                     for j in range(i + 1, min(i + 8, end)):
                         cand_raw = lines[j]
+                        scanned_lines.append(cand_raw)
                         cand = cand_raw.strip("～〜- ").strip()
-
                         if re.fullmatch(r"[×xX]\s*\d+", cand_raw):
                             break
-
                         if _is_noise_title_line(cand):
                             continue
-
                         cand = re.sub(r"\s*[×xX]\s*\d+\s*$", "", cand).strip()
                         cand = cand.strip("～〜- ").strip()
                         if cand and not _is_noise_title_line(cand):
                             parts.append(cand)
-
                         if "×" in cand_raw:
                             break
-
                     title = " ".join([p for p in parts if p]).strip() or None
+                    logger.info(
+                        "life_tuning.parse debug: date_title matched pattern=C(jp_date_only_multiline) line=%s scanned_lines=%s parsed_date=%s title=%s",
+                        ln,
+                        scanned_lines,
+                        dt.isoformat(),
+                        title,
+                    )
                     return dt, title, True
 
-            # C) 時間なし + 同一行にタイトル前半あり（1/17 パターン）
+            # C) 時間なし + 同一行にタイトル前半あり（1月17日...）
             m3 = _JP_DATE_WITH_TITLE_HEAD_RE.match(ln)
             if m3:
                 month = int(m3.group(1))
                 day = int(m3.group(2))
-                tail = m3.group(3).strip()  # 同じ行のタイトル前半
+                tail = m3.group(3).strip()
                 y = _guess_year(month, day)
 
                 try:
@@ -455,38 +527,88 @@ def _extract_date_title_from_order_section(text: str) -> Tuple[Optional[datetime
 
                 if dt:
                     parts: List[str] = []
+                    scanned_lines: List[str] = []
 
-                    if tail and not _is_noise_title_line(tail):
-                        # 同じ行で "×1" が付いてたら削る
-                        tail = re.sub(r"\s*[×xX]\s*\d+\s*$", "", tail).strip()
-                        tail = tail.strip("～〜- ").strip()
-                        if tail and not _is_noise_title_line(tail):
-                            parts.append(tail)
+                    tail2 = re.sub(r"\s*[×xX]\s*\d+\s*$", "", tail).strip()
+                    tail2 = tail2.strip("～〜- ").strip()
+                    if tail2 and not _is_noise_title_line(tail2):
+                        parts.append(tail2)
 
-                    # 次行に続きタイトル（～... ×1）があることが多い
                     for j in range(i + 1, min(i + 5, end)):
                         cand_raw = lines[j]
+                        scanned_lines.append(cand_raw)
                         cand = cand_raw.strip()
-
-                        # 数量だけの行
                         if re.fullmatch(r"[×xX]\s*\d+", cand):
                             break
-
-                        # タイトル続きとして許容（先頭に ～ が来ることがある）
                         cand2 = cand.strip("～〜- ").strip()
                         if _is_noise_title_line(cand2) and ("×" not in cand):
                             break
-
                         cand2 = re.sub(r"\s*[×xX]\s*\d+\s*$", "", cand2).strip()
                         if cand2 and not _is_noise_title_line(cand2):
                             parts.append(cand2)
-
                         if "×" in cand_raw:
                             break
 
                     title = " ".join([p for p in parts if p]).strip() or None
+                    logger.info(
+                        "life_tuning.parse debug: date_title matched pattern=D(jp_date_with_title_head) line=%s tail=%s scanned_lines=%s parsed_date=%s title=%s",
+                        ln,
+                        tail,
+                        scanned_lines,
+                        dt.isoformat(),
+                        title,
+                    )
                     return dt, title, True
 
+            # NEW: 時間なし + mm/dd(曜) + 同一行にタイトル（9/29(月）... / 11/1(土）...）
+            m4 = _DATE_MMDD_WITH_TITLE_HEAD_RE.match(ln)
+            if m4:
+                month = int(m4.group(1))
+                day = int(m4.group(2))
+                tail = m4.group(3).strip()
+                y = _guess_year(month, day)
+
+                try:
+                    dt = datetime(y, month, day, 12, 0)
+                except ValueError:
+                    dt = None
+
+                if dt:
+                    parts: List[str] = []
+                    scanned_lines: List[str] = []
+
+                    tail2 = re.sub(r"\s*[×xX]\s*\d+\s*$", "", tail).strip()
+                    tail2 = tail2.strip("～〜- ").strip()
+                    if tail2 and not _is_noise_title_line(tail2):
+                        parts.append(tail2)
+
+                    for j in range(i + 1, min(i + 4, end)):
+                        cand_raw = lines[j]
+                        scanned_lines.append(cand_raw)
+                        cand = cand_raw.strip()
+                        if re.fullmatch(r"[×xX]\s*\d+", cand):
+                            break
+                        cand2 = cand.strip("～〜- ").strip()
+                        if _is_noise_title_line(cand2) and ("×" not in cand):
+                            break
+                        cand2 = re.sub(r"\s*[×xX]\s*\d+\s*$", "", cand2).strip()
+                        if cand2 and not _is_noise_title_line(cand2):
+                            parts.append(cand2)
+                        if "×" in cand_raw:
+                            break
+
+                    title = " ".join([p for p in parts if p]).strip() or None
+                    logger.info(
+                        "life_tuning.parse debug: date_title matched pattern=E(mmdd_with_title_head) line=%s tail=%s scanned_lines=%s parsed_date=%s title=%s",
+                        ln,
+                        tail,
+                        scanned_lines,
+                        dt.isoformat(),
+                        title,
+                    )
+                    return dt, title, True
+
+    logger.info("life_tuning.parse debug: date_title not matched in order section")
     return None, None, False
 
 
@@ -495,32 +617,63 @@ def _extract_date_title_from_order_section(text: str) -> Tuple[Optional[datetime
 # ----------------------------
 
 def parse_life_tuning(msg: GmailMessage) -> Optional[Event]:
-    raw = msg.text_plain or msg.text_html or msg.raw_rfc822 or ""
+    raw = msg.text_plain or msg.text_html or getattr(msg, "raw_rfc822", None) or ""
     if not raw:
+        logger.info(
+            "life_tuning.parse debug: FAIL empty_raw msg_id=%s subject=%s",
+            msg.id,
+            msg.subject or "",
+        )
         return None
 
     text, soup = _to_text_and_soup(msg)
-    if not text and msg.raw_rfc822:
-        # 最低限 raw_rfc822 をテキストとして使うフォールバック
-        text = msg.raw_rfc822
+    raw_rfc822 = getattr(msg, "raw_rfc822", None)
+
+    if not text and raw_rfc822:
+        text = raw_rfc822
+        logger.info("life_tuning.parse debug: using raw_rfc822 as text fallback")
 
     if not text:
+        logger.info(
+            "life_tuning.parse debug: FAIL empty_text msg_id=%s subject=%s",
+            msg.id,
+            msg.subject or "",
+        )
         return None
 
-    # 注文概要から date/title を優先抽出
     parsed_date, parsed_title, parsed_time_unknown = _extract_date_title_from_order_section(text)
 
     date = parsed_date
     time_unknown = parsed_time_unknown
     confidence = 1.0 if parsed_date else 0.7
 
-    # 最終fallback（日付だけは最低限取りたい）
+    logger.info(
+        "life_tuning.parse debug: after_order_section parsed_date=%s parsed_title=%s parsed_time_unknown=%s confidence=%s",
+        parsed_date.isoformat() if parsed_date else None,
+        parsed_title,
+        parsed_time_unknown,
+        confidence,
+    )
+
     if not date:
         date = parse_first_datetime(text)
         if not date:
+            logger.info(
+                "life_tuning.parse debug: FAIL no_date msg_id=%s subject=%s order_no=%s source_url=%s map_url=%s",
+                msg.id,
+                msg.subject or "",
+                _extract_order_number(text),
+                _extract_source_url(text, soup, raw_rfc822),
+                _extract_map_url(text, soup, raw_rfc822),
+            )
             return None
         time_unknown = False
         confidence = 0.6
+        logger.info(
+            "life_tuning.parse debug: date fallback parse_first_datetime success date=%s confidence=%s",
+            date.isoformat(),
+            confidence,
+        )
 
     title = first_non_empty(
         parsed_title,
@@ -531,16 +684,23 @@ def parse_life_tuning(msg: GmailMessage) -> Optional[Event]:
     )
 
     reservation_id = _extract_order_number(text)
-
-    # source_url（order URL）
-    source_url = _extract_source_url(text, soup, msg.raw_rfc822)
-
-    # 会場名 & 地図URL（最小修正として address に maps URL を入れる）
+    source_url = _extract_source_url(text, soup, raw_rfc822)
     location_name = _extract_location_name(text)
-    map_url = _extract_map_url(text, soup, msg.raw_rfc822)
-
-    # 金額（税込み）を option_menus に入れる
+    map_url = _extract_map_url(text, soup, raw_rfc822)
     option_menus = _extract_price_option(text)
+
+    logger.info(
+        "life_tuning.parse debug: final_fields msg_id=%s reservation_id=%s title=%s date=%s time_unknown=%s location_name=%s map_url=%s source_url=%s option_menus=%s",
+        msg.id,
+        reservation_id,
+        title,
+        date.isoformat() if date else None,
+        time_unknown,
+        location_name,
+        map_url,
+        source_url,
+        option_menus,
+    )
 
     return Event(
         provider="life_tuning",
