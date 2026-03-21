@@ -211,6 +211,17 @@ def fetch_source_text(url: str, timeout_sec: int) -> str:
         res = session.get(url, timeout=timeout_sec, allow_redirects=True)
 
     res.raise_for_status()
+
+    logger.info(
+        "ai_enricher.fetch: encoding=%s apparent_encoding=%s url_final=%s",
+        res.encoding,
+        res.apparent_encoding,
+        str(res.url),
+    )
+
+    if not res.encoding or res.encoding.lower() in {"iso-8859-1", "ascii"}:
+        res.encoding = res.apparent_encoding
+
     html = res.text or ""
 
     logger.info(
@@ -714,5 +725,38 @@ def enrich_event(config: Config, msg: GmailMessage, event: Event) -> tuple[Event
     for key in fill_targets:
         if _fill_if_missing(merged, key, getattr(enrich, key)):
             filled.append(key)
+
+    logger.info(
+        "ai_enricher.diff: provider=%s skip_source=%s filled=%s before=%s ai=%s after=%s confidence=%s evidence=%s",
+        provider,
+        skip_source,
+        filled,
+        {
+            "instructor": event.instructor,
+            "location_name": event.location_name,
+            "address": event.address,
+            "base_price": event.base_price,
+            "option_menus": event.option_menus,
+            "ticket_types": event.ticket_types,
+        },
+        {
+            "instructor": enrich.instructor if enrich else None,
+            "location_name": enrich.location_name if enrich else None,
+            "address": enrich.address if enrich else None,
+            "base_price": enrich.base_price if enrich else None,
+            "option_menus": enrich.option_menus if enrich else None,
+            "ticket_types": enrich.ticket_types if enrich else None,
+        },
+        {
+            "instructor": merged.instructor,
+            "location_name": merged.location_name,
+            "address": merged.address,
+            "base_price": merged.base_price,
+            "option_menus": merged.option_menus,
+            "ticket_types": merged.ticket_types,
+        },
+        enrich.confidence if enrich else None,
+        enrich.evidence if enrich else None,
+    )
 
     return merged, filled, enrich
