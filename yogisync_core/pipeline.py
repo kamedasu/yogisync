@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from .ai_enricher import enrich_event
 from .collector_gmail import fetch_messages
 from .config import Config
 from .models import SyncResult
@@ -24,6 +25,17 @@ PARSER_MAP = {
     "mosh": parse_mosh,
     "life_tuning": parse_life_tuning,
 }
+
+
+def _parse_provider_list(value: str) -> set[str]:
+    return {p.strip().lower() for p in (value or "").split(",") if p.strip()}
+
+
+def _is_enricher_target_provider(config: Config, provider: str) -> bool:
+    targets = _parse_provider_list(getattr(config, "ai_enricher_target_providers", "") or "")
+    if not targets:
+        return False
+    return (provider or "").strip().lower() in targets
 
 
 def run_sync(config: Config, limit: int = 50) -> SyncResult:
@@ -106,6 +118,42 @@ def run_sync(config: Config, limit: int = 50) -> SyncResult:
                     )
                     result.skipped += 1
                     continue
+
+                # AIメタ補完（parse/yoga_classifierの後、storeの前）
+                # 必須条件:
+                # - YOGA_CLASSIFIER_ENABLED=true
+                # - AI_ENRICHER_ENABLED=true
+                # - provider が AI_ENRICHER_TARGET_PROVIDERS に含まれる
+                if (
+                    config.yoga_classifier_enabled
+                    and getattr(config, "ai_enricher_enabled", False)
+                    and _is_enricher_target_provider(config, event.provider)
+                ):
+                    try:
+                        enriched_event, filled_fields, enrich_result = enrich_event(config, msg, event)
+                        event = enriched_event
+                        logger.info(
+                            "ai_enricher: applied provider=%s source_url=%s filled_fields=%s confidence=%s",
+                            event.provider,
+                            event.source_url,
+                            filled_fields,
+                            None if enrich_result is None else enrich_result.confidence,
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "ai_enricher: skipped due to error provider=%s source_url=%s err=%s",
+                            event.provider,
+                            event.source_url,
+                            exc,
+                        )
+                else:
+                    logger.info(
+                        "ai_enricher: not_applied provider=%s enabled=%s yoga_enabled=%s target=%s",
+                        event.provider,
+                        getattr(config, "ai_enricher_enabled", False),
+                        config.yoga_classifier_enabled,
+                        _is_enricher_target_provider(config, event.provider),
+                    )
 
                 action, gcal_event_id = store.upsert_event(event)
 

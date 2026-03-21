@@ -42,6 +42,19 @@ class Config:
     # 空文字なら全provider対象（後方互換）
     yoga_classifier_target_providers: str
 
+    # --- NEW: AIメタ補完 ---
+    # 注意: 実行時は YOGA_CLASSIFIER_ENABLED=true が必須（pipeline側で強制）
+    ai_enricher_enabled: bool
+    # 例: "peatix,yes_tokyo" / 空文字なら無効（安全側）
+    ai_enricher_target_providers: str
+    ai_enricher_skip_source_providers: str
+    ai_enricher_max_chars_mail: int
+    ai_enricher_max_chars_source: int
+    ai_enricher_http_timeout_sec: int
+    ai_enricher_model: str
+    ai_enricher_fail_open: bool
+    ai_enricher_cache_ttl_hours: int
+
 
 def _parse_bool(value: Optional[str], default: bool) -> bool:
     if value is None:
@@ -148,6 +161,54 @@ def load_config(source: Optional[SettingsSource] = None, dotenv_path: Optional[s
         or ""
     )
 
+    # --- NEW: AIメタ補完設定 ---
+    ai_enricher_enabled_raw = (
+        src.get("AI_ENRICHER_ENABLED")
+        if src.get("AI_ENRICHER_ENABLED") is not None
+        else src.get("ai_enricher_enabled")
+    )
+    ai_enricher_enabled = _parse_bool(ai_enricher_enabled_raw, yoga_classifier_enabled)
+    ai_enricher_target_providers = (
+        src.get("AI_ENRICHER_TARGET_PROVIDERS")
+        or src.get("ai_enricher_target_providers")
+        or ""
+    )
+    ai_enricher_skip_source_providers = (
+        src.get("AI_ENRICHER_SKIP_SOURCE_PROVIDERS")
+        or src.get("ai_enricher_skip_source_providers")
+        or ""
+    )
+    ai_enricher_max_chars_mail = _parse_int(
+        src.get("AI_ENRICHER_MAX_CHARS_MAIL")
+        or src.get("ai_enricher_max_chars_mail"),
+        1200,
+    )
+    ai_enricher_max_chars_source = _parse_int(
+        src.get("AI_ENRICHER_MAX_CHARS_SOURCE")
+        or src.get("ai_enricher_max_chars_source"),
+        2500,
+    )
+    ai_enricher_http_timeout_sec = _parse_int(
+        src.get("AI_ENRICHER_HTTP_TIMEOUT_SEC")
+        or src.get("ai_enricher_http_timeout_sec"),
+        10,
+    )
+    ai_enricher_model = (
+        src.get("AI_ENRICHER_MODEL")
+        or src.get("ai_enricher_model")
+        or openai_model_yoga_classifier
+    )
+    ai_enricher_fail_open = _parse_bool(
+        src.get("AI_ENRICHER_FAIL_OPEN")
+        or src.get("ai_enricher_fail_open"),
+        True,
+    )
+    ai_enricher_cache_ttl_hours = _parse_int(
+        src.get("AI_ENRICHER_CACHE_TTL_HOURS")
+        or src.get("ai_enricher_cache_ttl_hours"),
+        24,
+    )
+
     return Config(
         gmail_query=gmail_query,
         google_client_secret_path=google_client_secret_path,
@@ -165,5 +226,14 @@ def load_config(source: Optional[SettingsSource] = None, dotenv_path: Optional[s
         yoga_classifier_keyword_fallback_enabled=yoga_classifier_keyword_fallback_enabled,
         yoga_classifier_keyword_fallback_terms=yoga_classifier_keyword_fallback_terms,
         yoga_classifier_keyword_fallback_on_errors=yoga_classifier_keyword_fallback_on_errors,
-        yoga_classifier_target_providers=yoga_classifier_target_providers,  # --- NEW ---
+        yoga_classifier_target_providers=yoga_classifier_target_providers,
+        ai_enricher_enabled=ai_enricher_enabled,
+        ai_enricher_target_providers=ai_enricher_target_providers,
+        ai_enricher_skip_source_providers=ai_enricher_skip_source_providers,
+        ai_enricher_max_chars_mail=ai_enricher_max_chars_mail,
+        ai_enricher_max_chars_source=ai_enricher_max_chars_source,
+        ai_enricher_http_timeout_sec=ai_enricher_http_timeout_sec,
+        ai_enricher_model=ai_enricher_model,
+        ai_enricher_fail_open=ai_enricher_fail_open,
+        ai_enricher_cache_ttl_hours=ai_enricher_cache_ttl_hours,
     )

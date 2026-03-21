@@ -7,3 +7,4 @@ pydantic
 python-dotenv
 python-dateutil
 openai>=1.40.0
+requests

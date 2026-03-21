@@ -232,6 +232,12 @@ _EVENT_SUBDOMAIN_RE = re.compile(
     re.I,
 )
 
+_PEATIX_EVENT_ID_PATTERNS = [
+    re.compile(r"https?://peatix\.com/event/(\d+)(?:[/?#]|$)", re.I),
+    re.compile(r"https?://peatix\.com/sales/event/(\d+)(?:[/?#]|$)", re.I),
+    re.compile(r"https?://[^/]+\.peatix\.com/view/(\d+)(?:[/?#]|$)", re.I),
+]
+
 
 def _normalize_url(url: str) -> str:
     u = (url or "").strip()
@@ -301,17 +307,23 @@ def _extract_urls_from_raw(raw: str) -> List[str]:
     return cleaned
 
 
+def _extract_peatix_event_id(urls: List[str]) -> Optional[str]:
+    for url in urls:
+        u = _normalize_url(url)
+        for pattern in _PEATIX_EVENT_ID_PATTERNS:
+            m = pattern.search(u)
+            if m:
+                return m.group(1)
+    return None
+
+
 def _extract_peatix_url(soup: BeautifulSoup, raw_html: str, text: str) -> Optional[str]:
     """
     source_url は「イベントページURL」を入れる。
 
     優先順位:
-      - JSON-LD url
-      - anchors
-      - raw html / text の直書きURL
-      - “イベント用サブドメイン” を最優先で採用（spinetwistcurryyoga0211.peatix.com など）
-      - それが無い場合に peatix.com/event/ を採用
-      - t.peatix / cdn / about / help / pricing は除外
+      - メール内URLから event_id を抽出できたら https://peatix.com/event/{id}
+      - 取れない場合のみ従来ロジックで候補選定
     """
     candidates: List[str] = []
 
@@ -330,6 +342,11 @@ def _extract_peatix_url(soup: BeautifulSoup, raw_html: str, text: str) -> Option
     # raw html / text
     candidates.extend(_extract_urls_from_raw(raw_html))
     candidates.extend(_extract_urls_from_raw(text))
+
+    # まず event_id を直接拾う
+    event_id = _extract_peatix_event_id(candidates)
+    if event_id:
+        return f"https://peatix.com/event/{event_id}"
 
     # peatixだけ残す
     candidates = [c for c in candidates if "peatix.com" in c]
@@ -402,7 +419,7 @@ def parse_peatix(msg: GmailMessage) -> Optional[Event]:
       - title: イベント名
       - reservation_id: 確認番号（JSON-LD優先）
       - address: 住所（JSON-LD優先）
-      - source_url: イベントページURL（例: https://xxxx.peatix.com/）
+      - source_url: イベントページURL
       - ticket_types: チケット種別（order-tableから）
     """
     html = msg.text_html or ""
@@ -433,10 +450,8 @@ def parse_peatix(msg: GmailMessage) -> Optional[Event]:
     address = _extract_address(text, soup)
     reservation_id = _extract_reservation_id(text, soup)
 
-    # ← ここが肝：help/about/t.peatix を弾いて、イベントURLを選ぶ
     source_url = _extract_peatix_url(soup, raw_html=html, text=text)
 
-    # NEW: チケット種別
     ticket_types = _extract_ticket_types_from_peatix_order_table(soup)
 
     return Event(
