@@ -97,10 +97,10 @@ def load_config(source: Optional[SettingsSource] = None, dotenv_path: Optional[s
     google_client_secret_path = (
         src.get("GOOGLE_CLIENT_SECRET_PATH")
         or src.get("google_client_secret_path")
-        or "client_secret.json"
+        or "secrets/client_secret.json"
     )
     google_token_path = (
-        src.get("GOOGLE_TOKEN_PATH") or src.get("google_token_path") or "token.json"
+        src.get("GOOGLE_TOKEN_PATH") or src.get("google_token_path") or "secrets/token.json"
     )
     yogisync_calendar_id = (
         src.get("YOGISYNC_CALENDAR_ID")

@@ -5,11 +5,15 @@ __pycache__/
 *.sqlite
 *.db
 *.log
-token.json
-# Google OAuth client secret (絶対コミットしない)
+
+# Local secrets / credentials
+secrets/
 client_secret.json
 client_secret*.json
+token.json
+
+# Local data
+/data/
 
 # macOS
 .DS_Store
-
