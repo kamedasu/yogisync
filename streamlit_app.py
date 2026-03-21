@@ -3,21 +3,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
+from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from dotenv import load_dotenv
 load_dotenv()
-
-try:
-    from geopy.geocoders import Nominatim
-except Exception:  # pragma: no cover - optional dependency runtime guard
-    Nominatim = None
 
 
 def _get_secret(key: str, default: Any = None) -> Any:
@@ -201,17 +200,44 @@ def build_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
     return df.sort_values("date", ascending=False)
 
 
+def _normalize_location_for_geocode(loc: str) -> str:
+    loc = (loc or "").strip()
+    if not loc or loc == "未設定":
+        return ""
+
+    # ざっくり：日本（東京/神奈川）に寄せる
+    if any(k in loc for k in ["東京都", "渋谷", "新宿", "港区", "目黒", "品川", "世田谷", "中央区", "千代田", "台東", "文京", "豊島"]):
+        return f"{loc}, Tokyo, Japan"
+    if any(k in loc for k in ["神奈川", "横浜", "川崎", "鎌倉", "湘南", "藤沢"]):
+        return f"{loc}, Kanagawa, Japan"
+
+    # 明示がなければ Japan を付ける
+    if "Japan" not in loc and "日本" not in loc:
+        return f"{loc}, Japan"
+    return loc
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def geocode_location(location_name: str) -> dict[str, float] | None:
-    if not Nominatim:
+    q = _normalize_location_for_geocode(location_name)
+    if not q:
         return None
 
+    # Nominatim(OpenStreetMap) へ標準ライブラリだけで問い合わせ
+    # ※レート制限があるので、上位N件だけ + cache で運用する前提
+    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+        {"q": q, "format": "json", "limit": "1"}
+    )
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "yogisync-phase2-dashboard/1.0 (contact: local)"},
+    )
     try:
-        geolocator = Nominatim(user_agent="yogisync-phase2-dashboard")
-        loc = geolocator.geocode(location_name, timeout=5)
-        if not loc:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not data:
             return None
-        return {"lat": loc.latitude, "lon": loc.longitude}
+        return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"])}
     except Exception:
         return None
 
@@ -236,9 +262,7 @@ def build_rule_based_comment(df: pd.DataFrame) -> str:
         lines.append(f"最も多いproviderは {top_provider.index[0]}（{int(top_provider.iloc[0])}件）です。")
 
     if not top_instructor.empty:
-        lines.append(
-            f"最も受講が多い講師は {top_instructor.index[0]}（{int(top_instructor.iloc[0])}件）です。"
-        )
+        lines.append(f"最も受講が多い講師は {top_instructor.index[0]}（{int(top_instructor.iloc[0])}件）です。")
 
     hard_ratio = intensity.get("ハード寄り", 0.0)
     soft_ratio = intensity.get("リラックス寄り", 0.0)
@@ -286,6 +310,43 @@ def maybe_generate_llm_comment(rule_comment: str, df: pd.DataFrame) -> str:
         return rule_comment
 
 
+def render_tokyo_area_map(map_df: pd.DataFrame) -> None:
+    # 東京駅あたり
+    default_center = {"lat": 35.681236, "lon": 139.767125}
+
+    if not map_df.empty:
+        center_lat = float(map_df["lat"].mean())
+        center_lon = float(map_df["lon"].mean())
+    else:
+        center_lat, center_lon = default_center["lat"], default_center["lon"]
+
+    view_state = pdk.ViewState(
+        latitude=center_lat,
+        longitude=center_lon,
+        zoom=10.5,
+        pitch=0,
+        bearing=0,
+    )
+
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=map_df,
+        get_position="[lon, lat]",
+        get_radius=200,
+        pickable=True,
+    )
+
+    tooltip = {"text": "{location}\n{count}件"}
+
+    deck = pdk.Deck(
+        map_style="mapbox://styles/mapbox/dark-v10",
+        initial_view_state=view_state,
+        layers=[layer],
+        tooltip=tooltip,
+    )
+    st.pydeck_chart(deck, use_container_width=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="YogiSync Phase2 Dashboard", layout="wide")
     st.title("YogiSync Phase2 | 私のヨガ活動ダッシュボード")
@@ -330,17 +391,23 @@ def main() -> None:
     else:
         st.write("該当なし")
 
-    st.subheader("受講場所マップ")
+    st.subheader("受講場所マップ（東京・神奈川に寄せて表示）")
     location_counts = df["location"].value_counts()
+
+    # Nominatimはレート制限あるので、上位だけ（cache前提）
+    top_locations = location_counts.head(30)
     map_rows = []
-    for location_name in location_counts.head(30).index.tolist():
+    for location_name, cnt in top_locations.items():
         geo = geocode_location(location_name)
+        # 少し間隔をあける（初回キャッシュが無いときだけ効く）
+        time.sleep(0.05)
         if not geo:
             continue
-        map_rows.append({"location": location_name, "lat": geo["lat"], "lon": geo["lon"]})
+        map_rows.append({"location": location_name, "count": int(cnt), "lat": geo["lat"], "lon": geo["lon"]})
 
     if map_rows:
-        st.map(pd.DataFrame(map_rows))
+        map_df = pd.DataFrame(map_rows)
+        render_tokyo_area_map(map_df)
     else:
         st.info("地図化できる住所が不足しているため、場所の頻出ランキングを表示します。")
         st.bar_chart(location_counts.head(20).rename_axis("location").to_frame("count"))
