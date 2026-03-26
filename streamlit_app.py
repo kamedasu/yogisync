@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -53,7 +53,6 @@ def _get_service_account_info() -> Dict[str, Any]:
     """
     sa = _get_secret("gcp_service_account")
     if sa:
-        # st.secrets は dict 相当で来る
         return dict(sa)
 
     path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
@@ -119,17 +118,6 @@ def fetch_events(calendar_id: str) -> list[dict[str, Any]]:
 # ============================================================
 
 def parse_description(desc: str) -> dict[str, str]:
-    """
-    description に入っている想定:
-      provider: xxx
-      event_uid: ...
-      reservation_id: ...
-      source_url: ...
-      confidence: ...
-      address: ...
-      instructor: ...
-      base_price: ...
-    """
     meta: dict[str, str] = {}
     if not desc:
         return meta
@@ -155,7 +143,6 @@ def extract_datetime(item: dict[str, Any]) -> Optional[datetime]:
         except Exception:
             return None
     if "date" in start:
-        # all-day: date only -> treat as noon JST-ish (but keep UTC)
         s = start["date"]
         try:
             d = datetime.fromisoformat(s).date()
@@ -165,19 +152,101 @@ def extract_datetime(item: dict[str, Any]) -> Optional[datetime]:
     return None
 
 
-def extract_instructor(summary: str, meta: dict[str, str]) -> str:
+def _normalize_spaces(s: str) -> str:
+    s = (s or "").replace("\u3000", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _strip_title_suffix(name: str) -> str:
+    """
+    ほのか先生 / ほのか 先生 / Honoka-san などの雑多な敬称を削る
+    """
+    n = _normalize_spaces(name)
+
+    # 括弧内の補足は残したいケースもあるが、
+    # 講師名の揺れ原因になりやすいので "完全一致" を優先して軽く除去
+    n = re.sub(r"[（(].*?[）)]", "", n).strip()
+
+    # 日本語の敬称
+    n = re.sub(r"(先生|さん|様|氏)$", "", n).strip()
+
+    # 英語っぽい敬称
+    n = re.sub(r"(?i)\s*(san|sensei)$", "", n).strip()
+
+    return n
+
+
+def _canonical_instructor(name: str) -> str:
+    """
+    よくある表記揺れを「代表名」に寄せる。
+    ここは増やしてOK（データが増えるほど効いてくる）。
+    """
+    n = _strip_title_suffix(name)
+
+    # 記号揺れ
+    n = n.replace("・", " ").replace("／", "/")
+    n = _normalize_spaces(n)
+
+    # ▼ ここから「固定マッピング」（必要に応じて追加）
+    # 例：上崎菜保子の揺れを1つに寄せる
+    if re.search(r"上崎\s*菜保子", n):
+        return "上崎菜保子"
+
+    # ほのか先生 / ほのか / ほのか。 → ほのか
+    if re.fullmatch(r"ほのか", n):
+        return "ほのか"
+
+    # NaOKO 表記ゆれ（例: NaOKO, NAoKO）を NaOKO に寄せる
+    if re.fullmatch(r"(?i)naoko", n):
+        return "NaOKO"
+
+    return n
+
+
+def split_instructors(raw: str) -> list[str]:
+    """
+    「ゆりこ・かほ」「朱音＆ゆりこ」などを分割して別々に数える。
+    """
+    if not raw:
+        return []
+
+    s = _normalize_spaces(raw)
+
+    # summaryの末尾 "- instructor" 形式が混じっている場合もあるので、まず素直に扱う
+    # 分割トークン：・ & ＆ / 、 , と and + など
+    s = s.replace("＆", "&")
+    # 区切りを統一
+    s = re.sub(r"\s*(?:・|/|&|,|、|\+|と|and)\s*", "|", s, flags=re.IGNORECASE)
+
+    parts = [p.strip() for p in s.split("|") if p.strip()]
+    cleaned: list[str] = []
+    for p in parts:
+        c = _canonical_instructor(p)
+        if c and c != "不明":
+            cleaned.append(c)
+
+    # 同一イベント内で同じ講師名が二重に出るのは潰す
+    # （例： "ほのか|ほのか先生" -> ["ほのか"]）
+    dedup = []
+    seen = set()
+    for x in cleaned:
+        if x not in seen:
+            seen.add(x)
+            dedup.append(x)
+    return dedup
+
+
+def extract_instructor_raw(summary: str, meta: dict[str, str]) -> str:
+    # description優先
     if meta.get("instructor"):
         return meta["instructor"].strip() or "不明"
 
-    # summary like: "[PEATIX] xxx - instructor"
+    # summary: "[PEATIX] xxx - instructor"
     if " - " in summary:
         tail = summary.rsplit(" - ", 1)[-1].strip()
-        if tail and len(tail) <= 40:
+        if tail and len(tail) <= 60:
             return tail
-
-    m = re.search(r"(?:講師|Instructor)[:：]\s*([^\n\r]+)", summary, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
 
     return "不明"
 
@@ -221,16 +290,10 @@ _TOKYO_HINTS = {
 
 
 def extract_area(location: str) -> str:
-    """
-    目標:
-      - 東京都 => 区/市 を拾って "東京:渋谷区" のように返す
-      - 神奈川県 => 市/区 を拾って "神奈川:横浜市" or "神奈川:横浜市中区" 的に返す
-      - それ以外/不明 => "その他" 扱い
-    """
     if not location:
         return "その他"
 
-    s = location.strip()
+    s = str(location).strip()
 
     # 東京都: 〜区 / 〜市
     if "東京都" in s:
@@ -240,7 +303,6 @@ def extract_area(location: str) -> str:
         m = re.search(r"東京都.*?([^\s　]+?市)", s)
         if m:
             return f"東京:{m.group(1)}"
-        # 住所っぽくない場合はヒントで補完
         for k, v in _TOKYO_HINTS.items():
             if k in s:
                 return v
@@ -264,17 +326,12 @@ def extract_area(location: str) -> str:
         if k in s:
             return v
 
-    # それ以外
     return "その他"
 
 
 def make_area_pie(df: pd.DataFrame) -> pd.DataFrame:
-    # location を area に変換
-    areas = df["location"].fillna("").astype(str).map(extract_area)
-    counts = areas.value_counts()
+    counts = df["area"].value_counts()
 
-    # 「東京:*」「神奈川:*」を中心に見せたい（その他はまとめ）
-    # まず上位を取って、残りはその他へ
     top_n = 12
     top = counts.head(top_n)
     others = counts.iloc[top_n:].sum()
@@ -284,80 +341,6 @@ def make_area_pie(df: pd.DataFrame) -> pd.DataFrame:
     pie_df = top.rename_axis("area").reset_index(name="count")
     pie_df["pct"] = (pie_df["count"] / pie_df["count"].sum() * 100).round(1)
     return pie_df
-
-
-# ============================================================
-# Rule-based comment + Optional LLM comment
-# ============================================================
-
-def build_rule_based_comment(df: pd.DataFrame) -> str:
-    lines: list[str] = []
-
-    total = len(df)
-    recent_90 = int(df["is_recent_90d"].sum())
-    this_month = int(df["is_this_month"].sum())
-    lines.append(f"過去データ全体で {total} 件、直近90日で {recent_90} 件、当月で {this_month} 件の受講があります。")
-
-    top_provider = df["provider"].value_counts().head(1)
-    if not top_provider.empty:
-        lines.append(f"最も多いproviderは {top_provider.index[0]}（{int(top_provider.iloc[0])}件）です。")
-
-    top_instructor = df[df["instructor"] != "不明"]["instructor"].value_counts().head(1)
-    if not top_instructor.empty:
-        lines.append(f"最も受講が多い講師は {top_instructor.index[0]}（{int(top_instructor.iloc[0])}件）です。")
-
-    intensity = df["intensity"].value_counts(normalize=True).round(3).to_dict()
-    hard_ratio = float(intensity.get("ハード寄り", 0.0))
-    soft_ratio = float(intensity.get("リラックス寄り", 0.0))
-    if hard_ratio >= 0.45:
-        lines.append("全体としてハード寄りのクラス比率が高めです。")
-    elif soft_ratio >= 0.45:
-        lines.append("全体としてリラックス寄りのクラス比率が高めです。")
-    else:
-        lines.append("強度傾向はバランス型です。")
-
-    # 地域のざっくり傾向
-    area_counts = df["location"].fillna("").astype(str).map(extract_area).value_counts()
-    if not area_counts.empty:
-        top_area = area_counts.index[0]
-        lines.append(f"受講場所は「{top_area}」が最多です。")
-
-    return "\n".join(lines)
-
-
-def maybe_generate_llm_comment(rule_comment: str, df: pd.DataFrame) -> str:
-    api_key = _get_secret("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key or df.empty:
-        return rule_comment
-
-    try:
-        from openai import OpenAI
-
-        model = _get_secret("OPENAI_MODEL") or os.getenv("OPENAI_MODEL", "gpt-5-mini")
-
-        provider_stats = df["provider"].value_counts().to_dict()
-        instructor_stats = df[df["instructor"] != "不明"]["instructor"].value_counts().head(10).to_dict()
-        intensity_stats = df["intensity"].value_counts(normalize=True).round(3).to_dict()
-
-        prompt = (
-            "あなたはヨガ活動の分析アシスタントです。\n"
-            "以下の統計をもとに、120文字以内で具体的な振り返りコメントを日本語で作ってください。\n"
-            f"rule_comment={rule_comment}\n"
-            f"provider_stats={provider_stats}\n"
-            f"instructor_stats={instructor_stats}\n"
-            f"intensity_stats={intensity_stats}\n"
-        )
-
-        client = OpenAI(api_key=api_key)
-        resp = client.responses.create(
-            model=model,
-            input=prompt,
-            max_output_tokens=200,
-        )
-        text = (resp.output_text or "").strip()
-        return text or rule_comment
-    except Exception:
-        return rule_comment
 
 
 # ============================================================
@@ -377,8 +360,8 @@ def build_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
         desc = item.get("description", "") or ""
         meta = parse_description(desc)
 
-        provider = meta.get("provider") or "unknown"
         location = item.get("location") or meta.get("address") or meta.get("location_name") or "未設定"
+        provider = meta.get("provider") or "unknown"
         confidence = meta.get("confidence", "")
 
         try:
@@ -386,13 +369,19 @@ def build_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
         except Exception:
             confidence_val = None
 
+        instructor_raw = extract_instructor_raw(summary, meta)
+        instructors = split_instructors(instructor_raw)
+        if not instructors:
+            instructors = ["不明"]
+
         rows.append(
             {
                 "date": dt,
                 "summary": summary,
                 "provider": provider,
-                "instructor": extract_instructor(summary, meta),
-                "location": location,
+                "instructor_raw": instructor_raw,
+                "instructors": instructors,  # list
+                "location": str(location),
                 "area": extract_area(str(location)),
                 "source_url": meta.get("source_url", ""),
                 "confidence": confidence_val,
@@ -408,7 +397,8 @@ def build_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
                 "date",
                 "summary",
                 "provider",
-                "instructor",
+                "instructor_raw",
+                "instructors",
                 "location",
                 "area",
                 "source_url",
@@ -421,10 +411,54 @@ def build_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     df["provider"] = df["provider"].replace("", "unknown").fillna("unknown")
-    df["instructor"] = df["instructor"].replace("", "不明").fillna("不明")
     df["location"] = df["location"].replace("", "未設定").fillna("未設定")
     df["area"] = df["area"].replace("", "その他").fillna("その他")
+    df["intensity"] = df["intensity"].replace("", "バランス").fillna("バランス")
+    df["instructor_raw"] = df["instructor_raw"].replace("", "不明").fillna("不明")
     return df.sort_values("date", ascending=False)
+
+
+# ============================================================
+# Instructor analytics (explode)
+# ============================================================
+
+def build_instructor_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    1イベントに複数講師がいる場合、講師ごとに1行に展開。
+    """
+    ex = df.copy()
+    ex = ex.explode("instructors", ignore_index=True)
+    ex["instructor"] = ex["instructors"].fillna("不明").astype(str)
+    ex.drop(columns=["instructors"], inplace=True)
+    return ex
+
+
+def inactive_instructors_with_last_date(ex: pd.DataFrame, days: int = 90) -> pd.DataFrame:
+    """
+    直近days日で0回の講師 + 最終受講日を返す（不明は除外）
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    valid = ex[ex["instructor"] != "不明"].copy()
+    if valid.empty:
+        return pd.DataFrame(columns=["instructor", "last_date"])
+
+    # 講師ごとの最終受講日
+    last_dates = valid.groupby("instructor")["date"].max().reset_index()
+    last_dates.rename(columns={"date": "last_date"}, inplace=True)
+
+    inactive = last_dates[last_dates["last_date"] < cutoff].sort_values("last_date", ascending=True)
+    inactive["last_date"] = inactive["last_date"].dt.tz_convert("Asia/Tokyo").dt.strftime("%Y-%m-%d")
+    return inactive.reset_index(drop=True)
+
+
+def top_instructors(ex: pd.DataFrame, n: int = 15) -> pd.DataFrame:
+    valid = ex[ex["instructor"] != "不明"].copy()
+    if valid.empty:
+        return pd.DataFrame(columns=["instructor", "count"])
+    counts = valid["instructor"].value_counts().head(n).rename_axis("instructor").reset_index(name="count")
+    return counts
 
 
 # ============================================================
@@ -449,63 +483,67 @@ def main() -> None:
         st.warning("イベントが取得できませんでした。カレンダー共有設定とCalendar IDを確認してください。")
         st.stop()
 
+    ex = build_instructor_table(df)
+
     # KPIs
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("総レッスン数", len(df))
     col2.metric("当月", int(df["is_this_month"].sum()))
     col3.metric("直近90日", int(df["is_recent_90d"].sum()))
+    col4.metric("ユニーク講師数", int(ex[ex["instructor"] != "不明"]["instructor"].nunique()))
 
-    st.subheader("provider別レッスン数")
-    provider_counts = df["provider"].value_counts().rename_axis("provider").to_frame("count")
-    st.bar_chart(provider_counts)
-
-    st.subheader("講師別レッスン数")
-    instructor_counts = (
-        df[df["instructor"] != "不明"]["instructor"].value_counts().rename_axis("instructor").to_frame("count")
-    )
-    if instructor_counts.empty:
+    # 1) 講師別：よく受けている
+    st.subheader("よく受けている講師（上位）")
+    top_df = top_instructors(ex, n=20)
+    if top_df.empty:
         st.info("講師情報のあるイベントがありません。")
     else:
-        st.bar_chart(instructor_counts.head(20))
+        fig = px.bar(top_df, x="instructor", y="count")
+        fig.update_layout(xaxis_title="", yaxis_title="回数")
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("最近受けていない講師（直近90日で0回）")
-    all_instructors = set(df[df["instructor"] != "不明"]["instructor"].tolist())
-    recent_instructors = set(df[(df["instructor"] != "不明") & (df["is_recent_90d"])]["instructor"].tolist())
-    inactive = sorted(all_instructors - recent_instructors)
-    if inactive:
-        st.write("、".join(inactive[:30]))
-    else:
+    # 2) 最近受けていない講師（いつから受けてないか）
+    st.subheader("最近受けていない講師（直近90日で0回 + 最終受講日）")
+    inactive_df = inactive_instructors_with_last_date(ex, days=90)
+    if inactive_df.empty:
         st.write("該当なし")
+    else:
+        st.dataframe(inactive_df, use_container_width=True, hide_index=True)
 
-    # ✅ Map removed, replaced with area pie chart
+    # 3) レッスン傾向（強度）
+    st.subheader("レッスン傾向（強度のざっくり分類）")
+    inten = df["intensity"].value_counts().rename_axis("intensity").reset_index(name="count")
+    fig2 = px.bar(inten, x="intensity", y="count")
+    fig2.update_layout(xaxis_title="", yaxis_title="回数")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # 4) 受講エリア（円グラフ％）
     st.subheader("受講エリア比率（東京都=区別 / 神奈川=市・区別）")
     pie_df = make_area_pie(df)
-
-    fig = px.pie(
+    fig3 = px.pie(
         pie_df,
         names="area",
         values="count",
         hover_data=["pct"],
         labels={"pct": "%"},
     )
-    fig.update_traces(textposition="inside", textinfo="percent+label")
-    st.plotly_chart(fig, use_container_width=True)
+    fig3.update_traces(textposition="inside", textinfo="percent+label")
+    st.plotly_chart(fig3, use_container_width=True)
 
-    # 補助：ランキングも出す
     with st.expander("エリア内訳（件数）"):
-        area_counts = (
-            df["area"].value_counts().rename_axis("area").to_frame("count").reset_index()
-        )
-        st.dataframe(area_counts, use_container_width=True)
+        area_counts = df["area"].value_counts().rename_axis("area").reset_index(name="count")
+        st.dataframe(area_counts, use_container_width=True, hide_index=True)
 
-    st.subheader("傾向分析コメント")
-    rule_comment = build_rule_based_comment(df)
-    final_comment = maybe_generate_llm_comment(rule_comment, df)
-    st.write(final_comment)
-
-    with st.expander("データプレビュー"):
+    # 5) データプレビュー（講師rawと正規化後も見える）
+    with st.expander("データプレビュー（イベント）"):
         st.dataframe(
-            df[["date", "provider", "instructor", "area", "location", "summary", "source_url", "confidence"]],
+            df[["date", "provider", "instructor_raw", "instructors", "area", "location", "summary", "source_url", "confidence"]],
+            use_container_width=True,
+        )
+
+    with st.expander("データプレビュー（講師ごとに展開）"):
+        st.dataframe(
+            ex[["date", "instructor", "area", "location", "summary", "provider"]],
             use_container_width=True,
         )
 
