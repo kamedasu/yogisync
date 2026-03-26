@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -11,7 +10,6 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# --- Optional dependencies (requirements に入ってる想定) ---
 import plotly.express as px
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -22,7 +20,6 @@ from googleapiclient.discovery import build
 # ============================================================
 
 def _get_secret(key: str) -> Any:
-    # Streamlit Cloud: st.secrets
     try:
         if key in st.secrets:
             return st.secrets[key]
@@ -32,7 +29,6 @@ def _get_secret(key: str) -> Any:
 
 
 def _get_calendar_id() -> str:
-    # Prefer env, then secrets
     cid = os.getenv("YOGISYNC_CALENDAR_ID") or _get_secret("YOGISYNC_CALENDAR_ID")
     if not cid:
         raise RuntimeError("YOGISYNC_CALENDAR_ID is not configured.")
@@ -41,13 +37,9 @@ def _get_calendar_id() -> str:
 
 def _get_service_account_info() -> Dict[str, Any]:
     """
-    A案: Streamlit Cloud の secrets.toml に gcp_service_account を置く
+    Streamlit Cloud: secrets.toml に gcp_service_account を置く
       [gcp_service_account]
       type="service_account"
-      project_id="..."
-      private_key_id="..."
-      private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-      client_email="..."
       ...
     もしくはローカル用に GOOGLE_SERVICE_ACCOUNT_PATH でJSONパス指定
     """
@@ -74,14 +66,75 @@ def get_calendar_service():
 
 
 # ============================================================
+# Instructor aliases (dictionary)
+# ============================================================
+
+def _normalize_spaces(s: str) -> str:
+    s = (s or "").replace("\u3000", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _strip_title_suffix(name: str) -> str:
+    n = _normalize_spaces(name)
+    n = re.sub(r"[（(].*?[）)]", "", n).strip()
+    n = re.sub(r"(先生|さん|様|氏)$", "", n).strip()
+    n = re.sub(r"(?i)\s*(san|sensei)$", "", n).strip()
+    return n
+
+
+def _norm_key(s: str) -> str:
+    """
+    辞書キー照合用の正規化：
+    - 全角スペース→半角
+    - 余分な空白潰し
+    - 末尾敬称除去
+    - 小文字化（英字系の揺れ吸収）
+    """
+    x = _strip_title_suffix(s)
+    x = _normalize_spaces(x)
+    return x.lower()
+
+
+def load_instructor_aliases() -> Dict[str, str]:
+    """
+    instructor_aliases.json を読み込む（任意）
+    - 環境変数 INSTRUCTOR_ALIAS_PATH があればそれを優先
+    - なければ ./instructor_aliases.json
+    """
+    path = os.getenv("INSTRUCTOR_ALIAS_PATH") or "instructor_aliases.json"
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        # 正規化キーにして保持
+        out: Dict[str, str] = {}
+        for k, v in data.items():
+            if not k or not v:
+                continue
+            out[_norm_key(str(k))] = _strip_title_suffix(str(v))
+        return out
+    except Exception:
+        return {}
+
+
+def apply_alias(name: str, aliases: Dict[str, str]) -> str:
+    key = _norm_key(name)
+    if key in aliases:
+        return aliases[key]
+    return name
+
+
+# ============================================================
 # Google Calendar fetch
 # ============================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_events(calendar_id: str) -> list[dict[str, Any]]:
-    """
-    直近〜未来の一定期間をまとめて取得（必要なら期間は調整）
-    """
     service = get_calendar_service()
 
     now = datetime.now(timezone.utc)
@@ -128,9 +181,8 @@ def parse_description(desc: str) -> dict[str, str]:
         k, v = line.split(":", 1)
         k = k.strip().lower()
         v = v.strip()
-        if not k:
-            continue
-        meta[k] = v
+        if k:
+            meta[k] = v
     return meta
 
 
@@ -146,103 +198,18 @@ def extract_datetime(item: dict[str, Any]) -> Optional[datetime]:
         s = start["date"]
         try:
             d = datetime.fromisoformat(s).date()
+            # all-dayは適当に昼固定（集計用）
             return datetime(d.year, d.month, d.day, 12, 0, tzinfo=timezone.utc)
         except Exception:
             return None
     return None
 
 
-def _normalize_spaces(s: str) -> str:
-    s = (s or "").replace("\u3000", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _strip_title_suffix(name: str) -> str:
-    """
-    ほのか先生 / ほのか 先生 / Honoka-san などの雑多な敬称を削る
-    """
-    n = _normalize_spaces(name)
-
-    # 括弧内の補足は残したいケースもあるが、
-    # 講師名の揺れ原因になりやすいので "完全一致" を優先して軽く除去
-    n = re.sub(r"[（(].*?[）)]", "", n).strip()
-
-    # 日本語の敬称
-    n = re.sub(r"(先生|さん|様|氏)$", "", n).strip()
-
-    # 英語っぽい敬称
-    n = re.sub(r"(?i)\s*(san|sensei)$", "", n).strip()
-
-    return n
-
-
-def _canonical_instructor(name: str) -> str:
-    """
-    よくある表記揺れを「代表名」に寄せる。
-    ここは増やしてOK（データが増えるほど効いてくる）。
-    """
-    n = _strip_title_suffix(name)
-
-    # 記号揺れ
-    n = n.replace("・", " ").replace("／", "/")
-    n = _normalize_spaces(n)
-
-    # ▼ ここから「固定マッピング」（必要に応じて追加）
-    # 例：上崎菜保子の揺れを1つに寄せる
-    if re.search(r"上崎\s*菜保子", n):
-        return "上崎菜保子"
-
-    # ほのか先生 / ほのか / ほのか。 → ほのか
-    if re.fullmatch(r"ほのか", n):
-        return "ほのか"
-
-    # NaOKO 表記ゆれ（例: NaOKO, NAoKO）を NaOKO に寄せる
-    if re.fullmatch(r"(?i)naoko", n):
-        return "NaOKO"
-
-    return n
-
-
-def split_instructors(raw: str) -> list[str]:
-    """
-    「ゆりこ・かほ」「朱音＆ゆりこ」などを分割して別々に数える。
-    """
-    if not raw:
-        return []
-
-    s = _normalize_spaces(raw)
-
-    # summaryの末尾 "- instructor" 形式が混じっている場合もあるので、まず素直に扱う
-    # 分割トークン：・ & ＆ / 、 , と and + など
-    s = s.replace("＆", "&")
-    # 区切りを統一
-    s = re.sub(r"\s*(?:・|/|&|,|、|\+|と|and)\s*", "|", s, flags=re.IGNORECASE)
-
-    parts = [p.strip() for p in s.split("|") if p.strip()]
-    cleaned: list[str] = []
-    for p in parts:
-        c = _canonical_instructor(p)
-        if c and c != "不明":
-            cleaned.append(c)
-
-    # 同一イベント内で同じ講師名が二重に出るのは潰す
-    # （例： "ほのか|ほのか先生" -> ["ほのか"]）
-    dedup = []
-    seen = set()
-    for x in cleaned:
-        if x not in seen:
-            seen.add(x)
-            dedup.append(x)
-    return dedup
-
-
 def extract_instructor_raw(summary: str, meta: dict[str, str]) -> str:
-    # description優先
     if meta.get("instructor"):
         return meta["instructor"].strip() or "不明"
 
-    # summary: "[PEATIX] xxx - instructor"
+    # summary: "... - instructor"
     if " - " in summary:
         tail = summary.rsplit(" - ", 1)[-1].strip()
         if tail and len(tail) <= 60:
@@ -264,6 +231,67 @@ def intensity_label(text: str) -> str:
     if soft > hard:
         return "リラックス寄り"
     return "バランス"
+
+
+def canonicalize_instructor(name: str, aliases: Dict[str, str]) -> str:
+    n = _strip_title_suffix(name)
+
+    # 記号揺れを軽く正規化
+    n = n.replace("・", " ").replace("／", "/")
+    n = _normalize_spaces(n)
+
+    # 辞書（エイリアス）を先に当てる
+    n = apply_alias(n, aliases)
+
+    # 固定マッピング（必要なら増やす）
+    # 上崎菜保子の揺れを吸収
+    if re.search(r"上崎\s*菜保子", n):
+        return "上崎菜保子"
+
+    # NaOKO 揺れ
+    if re.fullmatch(r"(?i)naoko", n):
+        return "NaOKO"
+
+    # ほのか先生 → ほのか（敬称除去で落ちるが念のため）
+    if re.fullmatch(r"ほのか", n):
+        return "ほのか"
+
+    # ★重要：緒方さと美 は “と” を含むが1人名
+    # ここで分割はしない（分割ロジック側で「と」を区切り扱いしない）
+    return n
+
+
+def split_instructors(raw: str, aliases: Dict[str, str]) -> list[str]:
+    """
+    「ゆりこ・かほ」「朱音＆ゆりこ」などを分割して別々に数える。
+    注意：日本語の「と」は人名内部に含まれ得る（例：緒方さと美）ので区切り扱いしない。
+    """
+    if not raw:
+        return []
+
+    s = _normalize_spaces(raw)
+    s = s.replace("＆", "&")
+
+    # 区切り：・ / & / 、 / , / + / / / and
+    s = re.sub(r"\s*(?:・|/|&|,|、|\+)\s*", "|", s)
+    s = re.sub(r"(?i)\s+and\s+", "|", s)
+
+    parts = [p.strip() for p in s.split("|") if p.strip()]
+
+    cleaned: list[str] = []
+    for p in parts:
+        c = canonicalize_instructor(p, aliases)
+        if c and c != "不明":
+            cleaned.append(c)
+
+    # 同一イベント内の重複は潰す（ほのか/ほのか先生問題など）
+    dedup: list[str] = []
+    seen = set()
+    for x in cleaned:
+        if x not in seen:
+            seen.add(x)
+            dedup.append(x)
+    return dedup
 
 
 # ============================================================
@@ -295,7 +323,6 @@ def extract_area(location: str) -> str:
 
     s = str(location).strip()
 
-    # 東京都: 〜区 / 〜市
     if "東京都" in s:
         m = re.search(r"東京都.*?([^\s　]+?区)", s)
         if m:
@@ -308,7 +335,6 @@ def extract_area(location: str) -> str:
                 return v
         return "東京:不明"
 
-    # 神奈川県: 市 (横浜市中区みたいに市+区も拾う)
     if "神奈川県" in s:
         m = re.search(r"神奈川県.*?([^\s　]+?市[^\s　]*?区)", s)
         if m:
@@ -321,7 +347,6 @@ def extract_area(location: str) -> str:
             return f"神奈川:{m.group(1)}"
         return "神奈川:不明"
 
-    # 県名が書かれてないケース（場所名だけ）を軽く拾う
     for k, v in _TOKYO_HINTS.items():
         if k in s:
             return v
@@ -331,7 +356,6 @@ def extract_area(location: str) -> str:
 
 def make_area_pie(df: pd.DataFrame) -> pd.DataFrame:
     counts = df["area"].value_counts()
-
     top_n = 12
     top = counts.head(top_n)
     others = counts.iloc[top_n:].sum()
@@ -347,7 +371,7 @@ def make_area_pie(df: pd.DataFrame) -> pd.DataFrame:
 # Build dataframe
 # ============================================================
 
-def build_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
+def build_dataframe(events: list[dict[str, Any]], aliases: Dict[str, str]) -> pd.DataFrame:
     now = datetime.now(timezone.utc)
     rows = []
 
@@ -370,7 +394,7 @@ def build_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
             confidence_val = None
 
         instructor_raw = extract_instructor_raw(summary, meta)
-        instructors = split_instructors(instructor_raw)
+        instructors = split_instructors(instructor_raw, aliases)
         if not instructors:
             instructors = ["不明"]
 
@@ -409,23 +433,16 @@ def build_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
             ]
         )
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows).sort_values("date", ascending=False)
     df["provider"] = df["provider"].replace("", "unknown").fillna("unknown")
     df["location"] = df["location"].replace("", "未設定").fillna("未設定")
     df["area"] = df["area"].replace("", "その他").fillna("その他")
     df["intensity"] = df["intensity"].replace("", "バランス").fillna("バランス")
     df["instructor_raw"] = df["instructor_raw"].replace("", "不明").fillna("不明")
-    return df.sort_values("date", ascending=False)
+    return df
 
-
-# ============================================================
-# Instructor analytics (explode)
-# ============================================================
 
 def build_instructor_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    1イベントに複数講師がいる場合、講師ごとに1行に展開。
-    """
     ex = df.copy()
     ex = ex.explode("instructors", ignore_index=True)
     ex["instructor"] = ex["instructors"].fillna("不明").astype(str)
@@ -434,9 +451,6 @@ def build_instructor_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def inactive_instructors_with_last_date(ex: pd.DataFrame, days: int = 90) -> pd.DataFrame:
-    """
-    直近days日で0回の講師 + 最終受講日を返す（不明は除外）
-    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
 
@@ -444,7 +458,6 @@ def inactive_instructors_with_last_date(ex: pd.DataFrame, days: int = 90) -> pd.
     if valid.empty:
         return pd.DataFrame(columns=["instructor", "last_date"])
 
-    # 講師ごとの最終受講日
     last_dates = valid.groupby("instructor")["date"].max().reset_index()
     last_dates.rename(columns={"date": "last_date"}, inplace=True)
 
@@ -453,7 +466,7 @@ def inactive_instructors_with_last_date(ex: pd.DataFrame, days: int = 90) -> pd.
     return inactive.reset_index(drop=True)
 
 
-def top_instructors(ex: pd.DataFrame, n: int = 15) -> pd.DataFrame:
+def top_instructors(ex: pd.DataFrame, n: int = 20) -> pd.DataFrame:
     valid = ex[ex["instructor"] != "不明"].copy()
     if valid.empty:
         return pd.DataFrame(columns=["instructor", "count"])
@@ -471,6 +484,39 @@ def main() -> None:
     st.set_page_config(page_title="YogiSync Phase2 Dashboard", layout="wide")
     st.title("YogiSync Phase2 | 私のヨガ活動ダッシュボード")
 
+    # --- aliases load + sidebar override ---
+    base_aliases = load_instructor_aliases()
+
+    st.sidebar.header("講師名ゆれ辞書（任意）")
+    st.sidebar.caption("`instructor_aliases.json` を置くか、ここでJSONをアップロードすると表記ゆれを吸収できます。")
+
+    upload = st.sidebar.file_uploader("辞書JSONをアップロード（任意）", type=["json"])
+    if upload is not None:
+        try:
+            data = json.load(upload)
+            if isinstance(data, dict):
+                merged = dict(base_aliases)
+                for k, v in data.items():
+                    if k and v:
+                        merged[_norm_key(str(k))] = _strip_title_suffix(str(v))
+                aliases = merged
+                st.sidebar.success("アップロード辞書を適用しました")
+            else:
+                aliases = base_aliases
+                st.sidebar.warning("JSONがdict形式ではないため無視しました")
+        except Exception:
+            aliases = base_aliases
+            st.sidebar.warning("JSONの読み込みに失敗しました（無視）")
+    else:
+        aliases = base_aliases
+
+    with st.sidebar.expander("現在の辞書（読み込み後）", expanded=False):
+        if aliases:
+            # 表示用にキーを戻して見やすく
+            st.json({k: v for k, v in list(aliases.items())[:200]})
+        else:
+            st.write("辞書なし（未設定）")
+
     try:
         calendar_id = _get_calendar_id()
         events = fetch_events(calendar_id)
@@ -478,7 +524,7 @@ def main() -> None:
         st.error(str(e))
         st.stop()
 
-    df = build_dataframe(events)
+    df = build_dataframe(events, aliases)
     if df.empty:
         st.warning("イベントが取得できませんでした。カレンダー共有設定とCalendar IDを確認してください。")
         st.stop()
@@ -534,13 +580,7 @@ def main() -> None:
         area_counts = df["area"].value_counts().rename_axis("area").reset_index(name="count")
         st.dataframe(area_counts, use_container_width=True, hide_index=True)
 
-    # 5) データプレビュー（講師rawと正規化後も見える）
-    with st.expander("データプレビュー（イベント）"):
-        st.dataframe(
-            df[["date", "provider", "instructor_raw", "instructors", "area", "location", "summary", "source_url", "confidence"]],
-            use_container_width=True,
-        )
-
+    # 5) データプレビュー（講師ごとに展開）だけ残す
     with st.expander("データプレビュー（講師ごとに展開）"):
         st.dataframe(
             ex[["date", "instructor", "area", "location", "summary", "provider"]],
